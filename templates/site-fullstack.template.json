@@ -1,0 +1,51 @@
+{
+  "name": "myapp",
+  "type": "fullstack",
+  "domain": "",
+  "apiDomain": "",
+  "localHost": "myapp.local",
+  "frontend": {
+    "build": "./frontend",
+    "image": null,
+    "port": 80,
+    "sedReplacements": [],
+    "generateDockerFile": false,
+    "server": "nginx",
+    "spa": false,
+    "index": "index.html",
+    "php": {
+      "enabled": false,
+      "version": "8.2"
+    },
+    "dotenv": {
+      "mode": "",
+      "source": "",
+      "filename": ".env",
+      "targetDir": "/var/www/html",
+      "vars": {}
+    }
+  },
+  "api": {
+    "build": "./api",
+    "image": null,
+    "port": 8080,
+    "configFile": "./api/application.properties"
+  },
+  "db": {
+    "engine": "mysql",
+    "name": "myapp",
+    "user": null,
+    "password": null,
+    "rootPassword": "ChangeMe!",
+    "initSql": "./initialize.sql",
+    "version": null
+  },
+  "paths": {
+    "apiPrefixes": [
+      "/api/",
+      "/authentication/"
+    ],
+    "stripApiPrefix": false
+  },
+  "useExternalDbOf": ""
+}

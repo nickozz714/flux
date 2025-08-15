@@ -1,0 +1,19 @@
+{
+  "bridge_iface": "br-proxy",
+  "wan_iface": "",
+  "lan_cidrs": [
+    "192.168.2.0/24"
+  ],
+  "allow_intercontainer": true,
+  "allow_dns": true,
+  "allow_web": true,
+  "allow_cloudflare_tunnel": true,
+  "cloudflare_tunnel_ports": [
+    7844
+  ],
+  "extra_egress_tcp_ports": [],
+  "extra_egress_udp_ports": [],
+  "drop_to_lan": true,
+  "catch_all_drop": true,
+  "enable_ipv6": false
+}

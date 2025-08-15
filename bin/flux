@@ -1,0 +1,1775 @@
+#!/usr/bin/env bash
+# flux — Manage multi-site Docker deployments behind nginx-proxy + Cloudflare tunnels.
+# Requires: bash, docker, docker compose plugin, jq, iptables/ip6tables
+
+set -euo pipefail
+
+VERSION="0.6.4 - ALPHA"
+PROG="${0##*/}"
+
+BASE_DIR="/Server/Applications"
+PROXY_DIR="${BASE_DIR}/_proxy"
+NETWORK_NAME="proxy_net"
+BRIDGE_NAME="br-proxy"
+
+# Config: override BASE_DIR and set REPO_DIR from /etc/flux/config.json (or $FLUX_CONFIG)
+CONFIG_FILE="${FLUX_CONFIG:-/etc/flux/config.json}"
+REPO_DIR_DEFAULT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_DIR="$REPO_DIR_DEFAULT"
+
+# ---------- Common Utilities ----------
+
+require() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; exit 1; }; }
+
+# Compose/Docker safe id:
+# - lowercase
+# - replace anything not [a-z0-9-] with '-'
+# - must start with a letter; if not, prefix 's-'
+# - avoid reserved 'x-' prefix used for Compose extensions; if so, prefix 's-'
+safe_id() {
+  local s="${1,,}"
+  s="$(printf '%s' "$s" | sed -E 's/[^a-z0-9-]+/-/g')"
+  case "$s" in
+    "" ) s="s";;
+    [!a-z]* ) s="s-${s}";;
+  esac
+  case "$s" in
+    x-*) s="s-${s}";;
+  esac
+  printf '%s' "$s"
+}
+
+ensure_jq() {
+  if command -v jq >/dev/null 2>&1; then return; fi
+  echo "jq not found; attempting to install..."
+  if command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get update -y || true
+    sudo apt-get install -y jq && return || true
+  fi
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64)  url="https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64" ;;
+    aarch64|arm64) url="https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-arm64" ;;
+    armv7l)        url="https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-armhf" ;;
+    *) url="";;
+  esac
+  if [ -n "$url" ]; then
+    if command -v curl >/dev/null 2>&1; then
+      sudo curl -fsSL "$url" -o /usr/local/bin/jq && sudo chmod +x /usr/local/bin/jq && return
+    elif command -v wget >/dev/null 2>&1; then
+      sudo wget -qO /usr/local/bin/jq "$url" && sudo chmod +x /usr/local/bin/jq && return
+    fi
+  fi
+  echo "Please install jq manually (https://jqlang.github.io/jq/)."
+  exit 1
+}
+
+load_config() {
+  if [ -f "$CONFIG_FILE" ]; then
+    ensure_jq
+    local _home; _home="$(jq -r '.homeDir // empty' "$CONFIG_FILE" 2>/dev/null || true)"
+    local _repo; _repo="$(jq -r '.repoDir // empty' "$CONFIG_FILE" 2>/dev/null || true)"
+    if [ -n "$_home" ]; then BASE_DIR="$_home"; fi
+    if [ -n "$_repo" ]; then REPO_DIR="$_repo"; fi
+  fi
+  PROXY_DIR="${BASE_DIR}/_proxy"
+}
+load_config
+
+json_get() { jq -r "$1 // empty" "$2"; }
+
+randstr() { tr -dc A-Za-z0-9 </dev/urandom | head -c "${1:-20}"; }
+
+ensure_base_dir() {
+  sudo mkdir -p "${BASE_DIR}" "${PROXY_DIR}"
+  sudo mkdir -p "${BASE_DIR}/_templates"
+}
+
+sync_env_kv() {
+  local file="$1" key="$2" val="$3"
+  sudo touch "$file"
+  if grep -q "^${key}=" "$file"; then
+    sudo sed -i "s|^${key}=.*|${key}=${val}|" "$file"
+  else
+    echo "${key}=${val}" | sudo tee -a "$file" >/dev/null
+  fi
+}
+
+ensure_env_kv_if_missing() {
+  local file="$1" key="$2" val="$3"
+  sudo touch "$file"
+  if ! grep -qE "^${key}=" "$file"; then
+    echo "${key}=${val}" | sudo tee -a "$file" >/dev/null
+  fi
+}
+
+# ---------- Network / Proxy ----------
+
+ensure_network() {
+  if ! docker network ls --format '{{.Name}}' | grep -qx "${NETWORK_NAME}"; then
+    echo "Creating network ${NETWORK_NAME} (${BRIDGE_NAME}) ..."
+    sudo docker network create --driver bridge --subnet 172.20.0.0/24 \
+      --opt "com.docker.network.bridge.name=${BRIDGE_NAME}" "${NETWORK_NAME}" >/dev/null
+  fi
+}
+
+init_proxy() {
+  mkdir -p "${PROXY_DIR}/vhost.d" "${PROXY_DIR}/html" "${PROXY_DIR}/certs"
+  if [ ! -f "${PROXY_DIR}/.env" ]; then
+    cat > "${PROXY_DIR}/.env" <<'EOF'
+DEFAULT_HOST=default.local
+EOF
+  fi
+  cat > "${PROXY_DIR}/docker-compose.yml" <<'YAML'
+version: "3.8"
+services:
+  nginx-proxy:
+    image: jwilder/nginx-proxy:latest
+    container_name: nginx-proxy
+    networks: [proxy_net]
+    environment:
+      - DEFAULT_HOST=${DEFAULT_HOST}
+    labels:
+      - com.github.nginx-proxy.nginx=true
+    volumes:
+      - /var/run/docker.sock:/tmp/docker.sock:ro
+      - ./certs:/etc/nginx/certs:rw
+      - ./vhost.d:/etc/nginx/vhost.d:rw
+      - ./html:/usr/share/nginx/html:rw
+    restart: unless-stopped
+networks:
+  proxy_net:
+    external: true
+YAML
+  (cd "${PROXY_DIR}" && sudo docker compose up -d)
+}
+
+reload_proxy() {
+  sudo docker exec nginx-proxy nginx -t >/dev/null 2>&1 || { echo "nginx config test failed"; exit 1; }
+  sudo docker exec nginx-proxy nginx -s reload >/dev/null 2>&1 || true
+  echo "nginx-proxy reloaded."
+}
+
+fresh() {
+  echo "Stopping and removing nginx-proxy & cloudflared (if present)..."
+  (cd "${PROXY_DIR}" && sudo docker compose down || true)
+  sudo docker rm -f cloudflared 2>/dev/null || true
+  echo "Reinitializing proxy..."
+  init_proxy
+}
+
+setup_tunnel() {
+  local token="$1"
+  mkdir -p "${PROXY_DIR}"
+  cat > "${PROXY_DIR}/.env.tunnel" <<EOF
+TUNNEL_TOKEN=${token}
+EOF
+  cat > "${PROXY_DIR}/cloudflared.yml" <<'YAML'
+version: "3.8"
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: unless-stopped
+    env_file: [ ./.env.tunnel ]
+    command: tunnel run --protocol http2 --edge-ip-version 4
+    networks: [proxy_net]
+networks:
+  proxy_net:
+    external: true
+YAML
+  (cd "${PROXY_DIR}" && sudo docker compose -f cloudflared.yml up -d)
+  echo "cloudflared (permanent tunnel) started."
+}
+
+# ---------- Normalization / Paths ----------
+
+ensure_site_dir() { mkdir -p "${BASE_DIR}/$1"; }
+
+normalize_config() {
+  # Input: $1 = source cfg (site.json)
+  # Output: prints normalized JSON to stdout
+  local cfg="$1"
+  jq -c '
+    . as $in
+    | {
+        name: (.name),
+        type: (.type // "static"),
+        localHost: (.localHost // (.name + ".local")),
+        domain: (.domain // ""),
+        apiDomain: (.apiDomain // ""),
+        frontend: (
+          {
+            build: (.frontend.build // "./"),
+            image: (.frontend.image // null),
+            port: ((.frontend.port // 80) | tostring),
+            server: (.frontend.server // "nginx"),
+            spa: ((.frontend.spa // false)|tostring),
+            index: (.frontend.index // "index.html"),
+            generateDockerFile: ((.frontend.generateDockerFile // false)|tostring),
+            php: {
+              enabled: ((.frontend.php.enabled // false)|tostring),
+              version: (.frontend.php.version // "8.2")
+            },
+            dotenv: (.frontend.dotenv // {})
+          }
+        ),
+        api: (
+          if (.type // "static") == "fullstack" then
+            {
+              build: (.api.build // "./api"),
+              image: (.api.image // null),
+              port: ((.api.port // 8080)|tostring),
+              configFile: (.api.configFile // null)
+            }
+          else
+            null
+          end
+        ),
+        db: (
+          if (.db // null) == null then
+            { engine: "mysql", name: null, user: null, password: null, rootPassword: null, initSql: null, version: null }
+          else
+            {
+              engine: (if (.db.engine // null) == null then "mysql" else .db.engine end),
+              name: (.db.name // .db.database // null),
+              user: (.db.user // null),
+              password: (.db.password // null),
+              rootPassword: (.db.rootPassword // null),
+              initSql: (.db.initSql // null),
+              version: (.db.version // null)
+            }
+          end
+        ),
+        paths: {
+          apiPrefixes: (.paths.apiPrefixes // ["/api/"]),
+          stripApiPrefix: ((.paths.stripApiPrefix // false)|tostring)
+        },
+        useExternalDbOf: (.useExternalDbOf // "")
+      }
+  ' "$cfg"
+}
+
+# ---------- Compose Builder ----------
+
+compose_init() {
+  local out="$1"
+  {
+    echo 'version: "3.8"'
+    echo
+    echo 'services:'
+  } > "$out"
+}
+
+compose_add_db() {
+  local norm="$1" out="$2"
+  local name db_engine db_name db_user db_pass db_root db_init db_ver svc
+  name="$(json_get '.name' "$norm")"
+  svc="$(safe_id "$name")"
+  db_engine="$(json_get '.db.engine' "$norm")"
+  db_name="$(json_get '.db.name' "$norm")"
+  db_user="$(json_get '.db.user' "$norm")"
+  db_pass="$(json_get '.db.password' "$norm")"
+  db_root="$(json_get '.db.rootPassword' "$norm")"
+  db_init="$(json_get '.db.initSql' "$norm")"
+  db_ver="$(json_get '.db.version' "$norm")"
+
+  [ -n "$db_engine" ] && [ "$db_engine" != "null" ] || return 0
+
+  case "$db_engine" in
+    mysql|mariadb)
+      local img="mysql:8"; [ "$db_engine" = "mariadb" ] && img="mariadb:${db_ver:-11}"
+      cat >> "$out" <<YAML
+  ${svc}-db:
+    image: ${img}
+    container_name: ${svc}-db
+    networks: [${svc}_internal]
+    environment:
+      - MYSQL_ROOT_PASSWORD=${db_root}
+      - MYSQL_DATABASE=${db_name}
+$( [ -n "$db_user" ] && echo "      - MYSQL_USER=${db_user}" )
+$( [ -n "$db_pass" ] && echo "      - MYSQL_PASSWORD=${db_pass}" )
+    volumes:
+      - db-data:/var/lib/mysql
+$( [ -n "$db_init" ] && echo "      - ./${db_init}:/docker-entrypoint-initdb.d/01_init.sql:ro" )
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--password=${db_root}", "--user=root"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+YAML
+      ;;
+    postgres)
+      cat >> "$out" <<YAML
+  ${svc}-db:
+    image: postgres:${db_ver:-16}
+    container_name: ${svc}-db
+    networks: [${svc}_internal]
+    environment:
+      - POSTGRES_PASSWORD=${db_root}
+      - POSTGRES_DB=${db_name}
+$( [ -n "$db_user" ] && echo "      - POSTGRES_USER=${db_user}" )
+    volumes:
+      - db-data:/var/lib/postgresql/data
+$( [ -n "$db_init" ] && echo "      - ./${db_init}:/docker-entrypoint-initdb.d/01_init.sql:ro" )
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${db_user:-postgres} -d ${db_name}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+YAML
+      ;;
+    *)
+      echo "WARN: Unsupported db.engine '${db_engine}' — skipping DB service." ;;
+  esac
+}
+
+
+compose_add_api() {
+  local norm="$1" out="$2"
+  local name a_build a_image a_port a_conf db_engine apiDomain svc
+  name="$(json_get '.name' "$norm")"
+  svc="$(safe_id "$name")"
+  a_build="$(json_get '.api.build' "$norm")"
+  a_image="$(json_get '.api.image' "$norm")"
+  a_port="$(json_get '.api.port' "$norm")"
+  a_conf="$(json_get '.api.configFile' "$norm")"
+  apiDomain="$(json_get '.apiDomain' "$norm")"
+  db_engine="$(json_get '.db.engine' "$norm")"
+
+  [ "$(json_get '.type' "$norm")" = "fullstack" ] || return 0
+
+  echo "  ${svc}-api:" >> "$out"
+  if [ -n "$a_image" ] && [ "$a_image" != "null" ]; then
+    echo "    image: ${a_image}" >> "$out"
+  else
+    echo "    build:" >> "$out"
+    echo "      context: ${a_build}" >> "$out"
+  fi
+  cat >> "$out" <<YAML
+    container_name: ${svc}-api
+    networks: [${NETWORK_NAME}, ${svc}_internal]
+    expose: ["${a_port}"]
+YAML
+
+  if [ -n "$db_engine" ] && [ "$db_engine" != "null" ]; then
+    cat >> "$out" <<YAML
+    depends_on:
+      ${svc}-db:
+        condition: service_healthy
+YAML
+  fi
+
+  if [ -n "$a_conf" ] && [ "$a_conf" != "null" ]; then
+    cat >> "$out" <<YAML
+    volumes:
+      - ${a_conf}:/config/application.properties:ro
+YAML
+  fi
+  if [ -n "$apiDomain" ]; then
+    cat >> "$out" <<YAML
+    environment:
+      - VIRTUAL_HOST=${apiDomain}
+YAML
+  fi
+  echo "    restart: unless-stopped" >> "$out"
+  echo >> "$out"
+}
+
+
+compose_add_frontend() {
+  local norm="$1" out="$2" site_dir="$3"
+  local name f_build f_image f_port f_php f_phpver f_server f_spa f_index svc
+  name="$(json_get '.name' "$norm")"
+  svc="$(safe_id "$name")"
+  f_build="$(json_get '.frontend.build' "$norm")"
+  f_image="$(json_get '.frontend.image' "$norm")"
+  f_port="$(json_get '.frontend.port' "$norm")"
+  f_server="$(json_get '.frontend.server' "$norm")"
+  f_spa="$(json_get '.frontend.spa' "$norm")"
+  f_index="$(json_get '.frontend.index' "$norm")"
+  f_php="$(json_get '.frontend.php.enabled' "$norm")"
+  f_phpver="$(json_get '.frontend.php.version' "$norm")"
+
+  local domain localHost front_vhost db_engine
+  domain="$(json_get '.domain' "$norm")"
+  localHost="$(json_get '.localHost' "$norm")"
+  [ -n "$domain" ] && front_vhost="${localHost},${domain}" || front_vhost="${localHost}"
+  db_engine="$(json_get '.db.engine' "$norm")"
+
+  echo "  ${svc}-front:" >> "$out"
+  if [ "$f_php" = "true" ]; then
+    if [ -n "$f_image" ] && [ "$f_image" != "null" ]; then
+      echo "    image: ${f_image}" >> "$out"
+    else
+      echo "    build:" >> "$out"
+      echo "      context: ${f_build}" >> "$out"
+    fi
+  else
+    if [ -n "$f_image" ] && [ "$f_image" != "null" ]; then
+      echo "    image: ${f_image}" >> "$out"
+    else
+      echo "    build:" >> "$out"
+      echo "      context: ${f_build}" >> "$out"
+    fi
+  fi
+
+  printf '    networks: [%s' "$NETWORK_NAME" >> "$out"
+  if [ -n "$db_engine" ] && [ "$db_engine" != "null" ]; then
+    printf ', %s' "${svc}_internal" >> "$out"
+  fi
+  echo "]" >> "$out"
+
+  cat >> "$out" <<YAML
+    container_name: ${svc}-front
+    environment:
+      - VIRTUAL_HOST=${front_vhost}
+    expose: ["${f_port}"]
+    restart: unless-stopped
+YAML
+
+  if [ "$f_php" = "true" ]; then
+    local dir; dir="$(cd "${site_dir}" && pwd)"
+    mapfile -t env_files < <(find "$dir" -maxdepth 1 -type f -name '*.env' -printf '%f\n' | sort)
+    if [ "${#env_files[@]}" -gt 0 ]; then
+      {
+        printf '    env_file: ['; local first=1
+        for f in "${env_files[@]}"; do
+          [ $first -eq 1 ] || printf ', '
+          printf '"%s"' "$f"; first=0
+        done
+        echo ']'
+        echo "    volumes:"
+        for f in "${env_files[@]}"; do
+          echo "      - ./${f}:/var/www/${f}:ro"
+        done
+      } >> "$out"
+    fi
+  fi
+
+  echo >> "$out"
+}
+
+
+compose_finalize() {
+  local norm="$1" out="$2"
+  local name db_engine svc
+  name="$(json_get '.name' "$norm")"
+  svc="$(safe_id "$name")"
+  db_engine="$(json_get '.db.engine' "$norm")"
+
+  {
+    echo 'volumes:'
+    echo '  db-data:'
+    echo
+    echo 'networks:'
+    cat <<NETS
+  ${NETWORK_NAME}:
+    external: true
+NETS
+    if [ -n "$db_engine" ] && [ "$db_engine" != "null" ]; then
+      cat <<NETS
+  ${svc}_internal:
+    name: ${svc}_internal
+    driver: bridge
+NETS
+    fi
+  } >> "$out"
+}
+
+
+# ---------- Vhost / Replacements ----------
+
+apply_front_replacements() {
+  local cfg="$1"; local site_dir="$2"
+  local count=$(jq '.frontend.sedReplacements | length // 0' "$cfg")
+  if [ "$count" -gt 0 ]; then
+    for i in $(seq 0 $((count-1))); do
+      local rel pat rep file
+      rel=$(jq -r ".frontend.sedReplacements[$i].file" "$cfg")
+      pat=$(jq -r ".frontend.sedReplacements[$i].pattern" "$cfg")
+      rep=$(jq -r ".frontend.sedReplacements[$i].replace" "$cfg")
+      file="${site_dir}/${rel}"
+      if [ -f "$file" ]; then
+        sudo sed -i "s#${pat}#${rep}#g" "$file"
+        echo "Applied replacement in $rel"
+      else
+        echo "WARN: replacement file not found: $rel"
+      fi
+    done
+  fi
+}
+
+write_vhost_rules() {
+  local norm="$1"
+  local name localHost domain a_port strip prefixes_json svc
+  name="$(json_get '.name' "$norm")"
+  svc="$(safe_id "$name")"
+  localHost="$(json_get '.localHost' "$norm")"
+  domain="$(json_get '.domain' "$norm")"
+  a_port="$(json_get '.api.port' "$norm")"; [ -z "$a_port" ] && a_port="8080"
+  strip="$(json_get '.paths.stripApiPrefix' "$norm")"
+  prefixes_json="$(jq -c '.paths.apiPrefixes // ["/api/"]' "$norm")"
+
+  mkdir -p "${PROXY_DIR}/vhost.d"
+  local hosts=("$localHost"); [ -n "$domain" ] && hosts+=("$domain")
+
+  if [ "$(json_get '.type' "$norm")" = "fullstack" ]; then
+    for host in "${hosts[@]}"; do
+      {
+        echo "${prefixes_json}" | jq -r '.[]' | while read -r prefix; do
+          case "$prefix" in */) : ;; *) prefix="${prefix}/";; esac
+          if [ "$strip" = "true" ]; then
+            cat <<EOP
+location ${prefix} {
+  proxy_pass http://${svc}-api:${a_port}/;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_read_timeout 300;
+}
+EOP
+          else
+            cat <<EOP
+location ${prefix} {
+  proxy_pass http://${svc}-api:${a_port}${prefix};
+  proxy_set_header Host \$host;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_read_timeout 300;
+}
+EOP
+          fi
+        done
+      } | sudo tee "${PROXY_DIR}/vhost.d/${host}" >/dev/null
+      echo "Wrote vhost rules: vhost.d/${host}"
+    done
+    reload_proxy
+  fi
+}
+
+
+# ---------- Dockerfile / Dotenv ----------
+
+ensure_frontend_dockerfile() {
+  local norm="$1"
+  local type="$(json_get '.type' "$norm")"
+  [ "$type" = "static" ] || return 0
+
+  local gen="$(json_get '.frontend.generateDockerFile' "$norm")"
+  [ "$gen" = "true" ] || { echo "generateDockerFile=false (or unset) — skipping Dockerfile generation."; return 0; }
+
+  local name site_dir
+  name="$(json_get '.name' "$norm")"
+  site_dir="${BASE_DIR}/${name}"
+
+  local f_build f_server f_spa f_index php_enabled phpver
+  f_build="$(json_get '.frontend.build' "$norm")"; [ -z "$f_build" ] && f_build="./"
+  f_server="$(json_get '.frontend.server' "$norm")"; [ -z "$f_server" ] && f_server="nginx"
+  f_spa="$(json_get '.frontend.spa' "$norm")"; [ -z "$f_spa" ] && f_spa="false"
+  f_index="$(json_get '.frontend.index' "$norm")"; [ -z "$f_index" ] && f_index="index.html"
+  php_enabled="$(json_get '.frontend.php.enabled' "$norm")"; [ -z "$php_enabled" ] && php_enabled="false"
+  phpver="$(json_get '.frontend.php.version' "$norm")"; [ -z "$phpver" ] && phpver="8.2"
+
+  local root="${site_dir}/${f_build#./}"
+  mkdir -p "$root"
+
+  if [ -f "${root}/Dockerfile" ]; then
+    echo "Dockerfile already present at ${root}/Dockerfile — not overwriting."
+    return 0
+  fi
+
+  if [ "$php_enabled" = "true" ]; then
+    cat >"$root/Dockerfile" <<DOCKER
+FROM php:${phpver}-apache
+
+RUN apt-get update \\
+ && apt-get install -y --no-install-recommends git zip unzip libzip-dev \\
+ && docker-php-ext-install pdo pdo_mysql mysqli zip \\
+ && a2enmod rewrite \\
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+
+WORKDIR /var/www/html
+COPY . /var/www/html/
+RUN sed -i 's/DirectoryIndex .*/DirectoryIndex index.html index.php/' /etc/apache2/mods-enabled/dir.conf
+
+# Production PHP defaults
+RUN set -eux; { \\
+  echo 'expose_php=Off'; \\
+  echo 'display_errors=Off'; \\
+  echo 'display_startup_errors=Off'; \\
+  echo 'log_errors=On'; \\
+  echo 'error_log=/proc/self/fd/2'; \\
+  echo 'error_reporting=E_ALL & ~E_DEPRECATED & ~E_USER_DEPRECATED & ~E_NOTICE & ~E_WARNING'; \\
+} > /usr/local/etc/php/conf.d/zz-prod.ini
+
+EXPOSE 80
+DOCKER
+  else
+    if [ "$f_server" = "caddy" ]; then
+      cat > "${root}/Dockerfile" <<'EOF'
+FROM caddy:alpine
+WORKDIR /usr/share/caddy
+COPY . .
+EXPOSE 80
+EOF
+      if [ "$f_spa" = "true" ]; then
+        cat > "${root}/Caddyfile" <<'EOF'
+:80 {
+  root * /usr/share/caddy
+  try_files {path} /index.html
+  file_server
+}
+EOF
+      fi
+    else
+      cat > "${root}/Dockerfile" <<'EOF'
+FROM nginx:alpine
+WORKDIR /usr/share/nginx/html
+COPY . .
+EXPOSE 80
+EOF
+      if [ "$f_spa" = "true" ]; then
+        mkdir -p "${root}/.nginx"
+        cat > "${root}/.nginx/default.conf" <<EOF
+server {
+  listen 80;
+  server_name _;
+  root /usr/share/nginx/html;
+  index ${f_index};
+  location / {
+    try_files \$uri /${f_index};
+  }
+}
+EOF
+        cat >> "${root}/Dockerfile" <<'EOF'
+
+# Use SPA-friendly config
+COPY .nginx/default.conf /etc/nginx/conf.d/default.conf
+EOF
+      fi
+    fi
+  fi
+
+  if [ ! -f "${root}/.dockerignore" ]; then
+    cat > "${root}/.dockerignore" <<'EOF'
+.git
+.DS_Store
+node_modules
+*.log
+*.map
+EOF
+  fi
+
+  echo "Generated ${root}/Dockerfile (php=${php_enabled}, server=${f_server}, spa=${f_spa})."
+}
+
+ensure_frontend_dotenv() {
+  local norm="$1"
+  local name site_dir
+  name="$(json_get '.name' "$norm")"
+  site_dir="${BASE_DIR}/${name}"
+
+  local f_build mode src filename targetDir php_enabled
+  f_build="$(json_get '.frontend.build' "$norm")"; [ -z "$f_build" ] && f_build="./"
+  local root="${site_dir}/${f_build#./}"
+  mode="$(json_get '.frontend.dotenv.mode' "$norm")"; [ -z "$mode" ] && mode=""
+  src="$(json_get '.frontend.dotenv.source' "$norm")"
+  filename="$(json_get '.frontend.dotenv.filename' "$norm")"; [ -z "$filename" ] && filename=".env"
+  targetDir="$(json_get '.frontend.dotenv.targetDir' "$norm")"; [ -z "$targetDir" ] && targetDir="/var/www/html"
+  php_enabled="$(json_get '.frontend.php.enabled' "$norm")"; [ -z "$php_enabled" ] && php_enabled="false"
+
+  mkdir -p "$root"
+
+  case "$mode" in
+    copy)
+      [ -n "$src" ] || { echo "dotenv.source required for mode=copy"; return 1; }
+      if [ -f "${root}/Dockerfile" ]; then
+        cp "${root}/${src#./}" "${root}/${filename}" 2>/dev/null || cp "${src}" "${root}/${filename}"
+        printf '\n# Include dotenv\nCOPY %s %s/%s\n' "$filename" "$targetDir" "$filename" >> "${root}/Dockerfile"
+      fi
+      ;;
+    template)
+      local tmp="${root}/${filename}"; : > "$tmp"
+      local jqvars='.frontend.dotenv.vars // {}'
+      while IFS='=' read -r k v; do [ -z "$k" ] && continue; export "$k"="$v"; done < <(jq -r "$jqvars | to_entries[] | \"\(.key)=\(.value)\"" "$norm")
+      if [ -n "$src" ] && [ -f "${root}/${src#./}" ]; then envsubst < "${root}/${src#./}" > "$tmp"
+      elif [ -n "$src" ] && [ -f "$src" ]; then envsubst < "$src" > "$tmp"
+      fi
+      if [ -f "${root}/Dockerfile" ]; then
+        printf '\n# Include templated dotenv\nCOPY %s %s/%s\n' "$filename" "$targetDir" "$filename" >> "${root}/Dockerfile"
+      fi
+      ;;
+    compose|"")
+      # Compose-based env mounting is handled in compose_add_frontend for PHP sites (.env files next to site.json)
+      :
+      ;;
+  esac
+}
+
+# ---------- Site Compose Orchestration ----------
+
+write_site_compose() {
+  local cfg="$1"
+  local norm_file
+  norm_file="$(mktemp)"
+  normalize_config "$cfg" > "$norm_file"
+
+  local name site_dir
+  name="$(json_get '.name' "$norm_file")"
+  site_dir="${BASE_DIR}/${name}"
+
+  local compose_path="${site_dir}/docker-compose.yml"
+  compose_init "$compose_path"
+  compose_add_db "$norm_file" "$compose_path"
+  compose_add_api "$norm_file" "$compose_path"
+  compose_add_frontend "$norm_file" "$compose_path" "$site_dir"
+  compose_finalize "$norm_file" "$compose_path"
+
+  # Also write normalized config for visibility
+  cp "$norm_file" "${site_dir}/site.normalized.json" 2>/dev/null || true
+  rm -f "$norm_file"
+}
+
+# ---------- Runtime Controls ----------
+
+site_up()       { (cd "${BASE_DIR}/$1" && sudo docker compose up -d --build); }
+site_up_force() { (cd "${BASE_DIR}/$1" && sudo docker compose build --no-cache --pull && sudo docker compose up -d --force-recreate); }
+site_down()     { (cd "${BASE_DIR}/$1" && sudo docker compose down || true); }
+
+connect_to_external_db_network() {
+  local cfg="$1"
+  local ext_raw="$(json_get '.useExternalDbOf' "$cfg")"
+  [ -z "$ext_raw" ] && return 0
+
+  local name_raw="$(json_get '.name' "$cfg")"
+  local name="$(safe_id "$name_raw")"
+  local ext="$(safe_id "$ext_raw")"
+
+  local net="${ext}_internal"
+  if ! sudo docker network inspect "$net" >/dev/null 2>&1; then
+    net="$(sudo docker network ls --format '{{.Name}}' | awk -v n="${ext}_internal" '$0 ~ "_" n "$" {print; exit}')"
+  fi
+
+  local candidates=("${name}-front" "${name}-api")
+  local svc
+  for svc in "${candidates[@]}"; do
+    if sudo docker ps --format '{{.Names}}' | grep -qx "$svc"; then
+      [ -n "$net" ] && sudo docker network connect "$net" "$svc" 2>/dev/null || true
+    fi
+  done
+
+  echo "Connected ${name_raw} services to ${net:-${ext}_internal} for DB access (host=${ext}-db:3306)."
+}
+
+# ---------- Commands ----------
+
+cmd_add_update() {
+  local cfg="$1"; local mode="$2"
+  [ -f "$cfg" ] || { echo "Config not found: $cfg"; exit 1; }
+  ensure_network; init_proxy
+  local name; name="$(json_get '.name' "$cfg")"
+  [ -n "$name" ] || { echo ".name missing in $cfg"; exit 1; }
+  ensure_site_dir "$name"
+  cp "$cfg" "${BASE_DIR}/${name}/site.json" 2>/dev/null || true
+  local norm_file; norm_file="$(mktemp)"; normalize_config "$cfg" > "$norm_file"
+
+  ensure_frontend_dockerfile "$norm_file"
+  ensure_frontend_dotenv "$norm_file"
+  write_site_compose "$cfg"
+  apply_front_replacements "$cfg" "${BASE_DIR}/${name}"
+  write_vhost_rules "$norm_file"
+
+  if [ "$mode" = "update" ]; then
+    site_up_force "$name"
+  else
+    site_up "$name"
+  fi
+  connect_to_external_db_network "$cfg"
+  rm -f "$norm_file"
+  echo "Site ${name} ${mode}d."
+}
+
+cmd_remove() {
+  local name="$1"; [ -n "$name" ] || { echo "Usage: $PROG remove <name>"; exit 1; }
+  site_down "$name"
+  local cfg_json="${BASE_DIR}/${name}/site.json"
+  if [ -f "$cfg_json" ]; then
+    local localHost=$(json_get '.localHost' "$cfg_json"); [ -z "$localHost" ] && localHost="${name}.local"
+    local domain=$(json_get '.domain' "$cfg_json")
+    sudo rm -f "${PROXY_DIR}/vhost.d/${localHost}" 2>/dev/null || true
+    [ -n "$domain" ] && sudo rm -f "${PROXY_DIR}/vhost.d/${domain}" 2>/dev/null || true
+  fi
+  reload_proxy || true
+  echo "Removed site ${name}."
+}
+
+cmd_list() { ls -1 "${BASE_DIR}" | sed -n '/^_proxy$/!p'; }
+
+cmd_quick_start() {
+  local name="$1"; local host="${2:-}"; [ -n "$name" ] || { echo "Usage: $PROG quick-start <name> [host]"; exit 1; }
+  if [ -z "$host" ]; then
+    if [ -f "${BASE_DIR}/${name}/site.json" ]; then
+      host="$(json_get '.domain' "${BASE_DIR}/${name}/site.json")"
+      [ -z "$host" ] && host="$(json_get '.localHost' "${BASE_DIR}/${name}/site.json")"
+    fi
+    [ -n "$host" ] || host="${name}.local"
+  fi
+  sudo docker rm -f "cf-quick-${name}" 2>/dev/null || true
+  sudo docker run -d --name "cf-quick-${name}" --network "${NETWORK_NAME}" \
+    cloudflare/cloudflared:latest tunnel --protocol http2 --edge-ip-version 4 \
+    --http-host-header "${host}" --url http://nginx-proxy:80 >/dev/null
+  echo "Quick Tunnel started for ${name} -> Host header: ${host}"
+  sleep 2
+  "$0" quick-url "${name}" || true
+}
+
+cmd_quick_stop() { [ -n "${1:-}" ] || { echo "Usage: $PROG quick-stop <name>"; exit 1; }; sudo docker rm -f "cf-quick-${1}" 2>/dev/null || true; echo "Quick Tunnel stopped for ${1}."; }
+cmd_quick_url()  { [ -n "${1:-}" ] || { echo "Usage: $PROG quick-url <name>"; exit 1; }; sudo docker logs "cf-quick-${1}" 2>&1 | grep -Eo 'https://[A-Za-z0-9-]+\.trycloudflare\.com' | tail -n1 || { echo "No trycloudflare URL yet."; exit 1; }; }
+cmd_reload_proxy(){ reload_proxy; }
+
+cmd_status() {
+  echo "== Containers =="
+  sudo docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Networks}}'
+  echo
+  echo "== Quick tunnels =="
+  sudo docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep '^cf-quick-' || true
+}
+
+# ---------- Home / Config / Web ----------
+
+cmd_config_show() {
+  echo "CONFIG_FILE: ${CONFIG_FILE}"
+  echo "BASE_DIR:    ${BASE_DIR}"
+  echo "REPO_DIR:    ${REPO_DIR}"
+}
+
+cmd_config_set() {
+  local key="${1:-}"; local val="${2:-}"
+  [ -n "$key" ] && [ -n "$val" ] || { echo "Usage: $PROG config set <homeDir|repoDir> <value>"; exit 1; }
+  ensure_jq
+  sudo mkdir -p "$(dirname "$CONFIG_FILE")"
+  if [ ! -f "$CONFIG_FILE" ]; then echo '{}' | sudo tee "$CONFIG_FILE" >/dev/null; fi
+  sudo jq --arg v "$val" ".$key=\$v" "$CONFIG_FILE" | sudo tee "$CONFIG_FILE.tmp" >/dev/null
+  sudo mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+  echo "Updated $key in $CONFIG_FILE"
+}
+
+cmd_home_prepare() {
+  local force="no"; local from_dir=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force="yes"; shift ;;
+      --from)  from_dir="$2"; shift 2 ;;
+      *) echo "Unknown flag: $1"; exit 1;;
+    esac
+  done
+  ensure_base_dir
+  local src="${from_dir:-${REPO_DIR}/templates}"
+  [ -d "$src" ] || { echo "Template source not found: $src"; exit 1; }
+  echo "Syncing templates from: $src -> ${BASE_DIR}/_templates"
+  sudo mkdir -p "${BASE_DIR}/_templates"
+
+  for f in site-static.template.json site-fullstack.template.json; do
+    if [ -f "$src/$f" ]; then
+      if [ "$force" = "yes" ] || [ ! -f "${BASE_DIR}/_templates/$f" ]; then
+        sudo cp -f "$src/$f" "${BASE_DIR}/_templates/$f"
+        echo "  copied $f"
+      else
+        echo "  exists $f (use --force to overwrite)"
+      fi
+    else
+      echo "  MISSING in source: $f"
+    fi
+  done
+  echo "Home prepared at ${BASE_DIR}."
+}
+
+cmd_home() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    show)      cmd_config_show ;;
+    set)       [ $# -ge 1 ] || { echo "Usage: $PROG home set <dir>"; exit 1; }; cmd_config_set homeDir "$1" ;;
+    prepare)   cmd_home_prepare "$@" ;;
+    repo-set)  [ $# -ge 1 ] || { echo "Usage: $PROG home repo-set <dir>"; exit 1; }; cmd_config_set repoDir "$1" ;;
+    *)
+      echo "Usage: $PROG home {show|set <dir>|prepare [--force] [--from DIR]|repo-set <dir>}"
+      exit 1;;
+  esac
+}
+
+cmd_web() {
+  local sub="${1:-}"; shift || true
+
+  # ---------- Portable defaults ----------
+  local BASE="/opt/flux-web" PORT="" TOKEN="" SRC=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --path)   BASE="$2"; shift 2 ;;
+      --port)   PORT="$2"; shift 2 ;;
+      --token)  TOKEN="$2"; shift 2 ;;
+      --from)   SRC="$2";  shift 2 ;;   # repo root (auto-detected if not provided)
+      *) break ;;
+    esac
+  done
+
+  # ---------- Paths ----------
+  local ETC="${BASE}/etc"
+  local WEB="${BASE}/web"
+  local SERVER="${BASE}/server.js"
+  local PKG="${BASE}/package.json"
+  local SERVICE="/etc/systemd/system/flux-web.service"
+
+  # Try to detect repo root (fallback: script/..)
+  if [ -z "$SRC" ]; then
+    local guess="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd || true)"
+    [ -d "$guess" ] && SRC="$guess"
+  fi
+
+  ensure_node() {
+    if ! command -v node >/dev/null 2>&1; then
+      echo "Node.js not found. Install Node (e.g., apt-get install -y nodejs npm or brew install node)."; return 1
+    fi
+    if ! command -v npm >/dev/null 2>&1; then
+      echo "npm not found. Install npm."; return 1
+    fi
+  }
+
+  # ---------- Generate robust server.js (portable) ----------
+  gen_server_js() {
+    cat > "$SERVER" <<'JS'
+// Portable Flux Web server
+const fs = require('fs');
+const path = require('path');
+const express = require('express');
+const { spawn } = require('child_process');
+
+const LOCAL_ETC = path.resolve(process.cwd(), 'etc');
+const defaultConfigPath = fs.existsSync(path.join(LOCAL_ETC, 'config.json'))
+  ? path.join(LOCAL_ETC, 'config.json')
+  : '/etc/flux-web/config.json';
+const defaultCatalogPath = fs.existsSync(path.join(LOCAL_ETC, 'catalog.json'))
+  ? path.join(LOCAL_ETC, 'catalog.json')
+  : '/etc/flux-web/catalog.json';
+
+const CONFIG_PATH = process.env.FLUX_WEB_CONFIG || defaultConfigPath;
+const CATALOG_PATH = process.env.FLUX_WEB_CATALOG || defaultCatalogPath;
+
+function safeJson(file, fallback) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch (e) { console.warn(`[flux-web] Note: cannot read ${file}: ${e.message}`); return fallback; }
+}
+
+let config = safeJson(CONFIG_PATH, {
+  token: 'REPLACE_WITH_A_LONG_RANDOM_TOKEN',
+  fluxPath: '/usr/local/bin/flux',
+  baseDir: '/Server/Applications',
+  staticDir: '', // empty -> use ./web if present
+  bind: '127.0.0.1',
+  port: 3088
+});
+let catalog = safeJson(CATALOG_PATH, { title: 'Flux Command Catalog', version: 'dev', commands: [] });
+
+const app = express();
+app.use(express.json({ limit: '1mb' }));
+
+function auth(req, res, next) {
+  const h = req.headers['authorization'] || '';
+  const viaAuth = h.startsWith('Bearer ') ? h.slice(7) : '';
+  const viaHeader = req.headers['x-flux-token'] || '';
+  const token = viaAuth || viaHeader || '';
+  const isLocal = (req.ip === '127.0.0.1' || req.ip === '::1' || (req.ip||'').endsWith('::1'));
+  if (!config.token || config.token === 'REPLACE_WITH_A_LONG_RANDOM_TOKEN') {
+    if (isLocal) return next();
+    return res.status(403).json({ error: 'Token not set. Edit config.json or send Authorization: Bearer <token>' });
+  }
+  if (token !== config.token) return res.status(401).json({ error: 'Unauthorized' });
+  next();
+}
+
+app.get('/api/ping', (req, res) => res.json({ ok: true, version: catalog.version || 'n/a' }));
+app.get('/api/catalog', auth, (req, res) => res.json({ title: catalog.title, version: catalog.version, commands: catalog.commands || [] }));
+
+function buildArgv(entry, body) {
+  const argv = [];
+  if (Array.isArray(entry.exec)) argv.push(...entry.exec);
+  argv.push(entry.name);
+  for (const a of (entry.args || [])) {
+    if (a.type === 'const') { argv.push(String(a.value)); continue; }
+    const v = body.args?.[a.name];
+    if (a.required && (v === undefined || v === null || v === '')) throw new Error(`Missing required arg: ${a.name}`);
+    if (v !== undefined && v !== null && v !== '') argv.push(String(v));
+  }
+  for (const f of (entry.flags || [])) {
+    const v = body.flags?.[f.name];
+    if (v !== undefined && v !== null && v !== '') {
+      argv.push(String(f.switch || `--${f.name}`), String(v));
+    }
+  }
+  if (Array.isArray(body.rawArgs)) argv.push(...body.rawArgs.map(String));
+  return argv;
+}
+
+app.post('/api/run', auth, (req, res) => {
+  try {
+    const { id } = req.body || {};
+    if (!id) return res.status(400).json({ error: 'Missing id' });
+    const entry = (catalog.commands || []).find(c => c.id === id);
+    if (!entry) return res.status(404).json({ error: 'Unknown command id' });
+
+    const argv = buildArgv(entry, req.body || {});
+    const fluxBin = config.fluxPath || '/usr/local/bin/flux';
+    const child = spawn(fluxBin, argv, { env: process.env });
+
+    let stdout = '', stderr = '';
+    child.stdout.on('data', d => stdout += d.toString());
+    child.stderr.on('data', d => stderr += d.toString());
+    child.on('close', code => res.json({ code, stdout, stderr, argv: [fluxBin, ...argv] }));
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// Static UI (config.staticDir > ./web)
+const staticDir = config.staticDir && config.staticDir.length
+  ? config.staticDir
+  : (fs.existsSync(path.resolve(process.cwd(), 'web')) ? path.resolve(process.cwd(), 'web') : '');
+if (staticDir) app.use(express.static(staticDir, { extensions: ['html'] }));
+
+// Friendly fallback instead of "Cannot GET /"
+app.get('*', (req, res) => {
+  if (staticDir) return res.status(404).send('Not found');
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.end(`<!doctype html><meta charset="utf-8"><title>Flux Web</title>
+  <h1>Flux Web</h1><p>No UI bundle found. API is available:</p>
+  <ul><li>GET /api/ping</li><li>GET /api/catalog (auth)</li><li>POST /api/run (auth)</li></ul>
+  <p>Put config in ./etc, UI in ./web, or set FLUX_WEB_CONFIG / FLUX_WEB_CATALOG env vars.</p>`);
+});
+
+const bind = config.bind || '127.0.0.1';
+const port = Number(process.env.PORT || config.port || 3088);
+app.listen(port, bind, () => {
+  console.log(`[flux-web] http://${bind}:${port}`);
+  console.log(`[flux-web] staticDir=${staticDir || '(none)'} config=${CONFIG_PATH} catalog=${CATALOG_PATH}`);
+});
+JS
+  }
+
+  gen_minimal_ui() {
+    mkdir -p "$WEB"
+    cat > "${WEB}/index.html" <<'HTML'
+<!doctype html><meta charset="utf-8"><title>Flux Web</title>
+<style>body{font-family:system-ui;margin:2rem;line-height:1.45}pre{background:#0b1020;color:#e7ecff;padding:12px;border-radius:10px;max-height:50vh;overflow:auto}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.card{border:1px solid #dcdfe6;border-radius:12px;padding:12px;margin:12px 0;background:#fafbff}</style>
+<h1>Flux Web (Minimal)</h1>
+<div class="card">
+  <button id="load">Load Catalog</button>
+  <input id="token" placeholder="Token (from etc/config.json)" size="48">
+  <select id="cmd" style="min-width:360px"></select>
+  <button id="run">Run</button>
+  <div id="args" class="row"></div>
+</div>
+<div class="card"><h3>Result</h3><pre id="out"></pre></div>
+<script>
+const el=id=>document.getElementById(id); const out=el('out'),sel=el('cmd'),args=el('args');
+let cat=null;
+const auth=()=>{const t=el('token').value.trim();return t?{'Authorization':'Bearer '+t}:{}};
+el('load').onclick=async()=>{out.textContent='Loading...';const r=await fetch('/api/catalog',{headers:auth()});if(!r.ok){out.textContent='Error '+r.status+' '+await r.text();return}cat=await r.json();sel.innerHTML='';for(const c of cat.commands){const o=document.createElement('option');o.value=c.id;o.textContent=c.id+' — '+(c.desc||'');sel.appendChild(o)}out.textContent='Loaded '+cat.commands.length+' commands';render()};
+function render(){args.innerHTML='';const id=sel.value;const entry=(cat&&cat.commands||[]).find(c=>c.id===id);if(!entry)return;for(const a of (entry.args||[])){if(a.type==='const')continue;const i=document.createElement('input');i.placeholder=a.name+(a.required?' *':'');i.dataset.name=a.name;i.size=30;args.appendChild(i)}}
+sel.onchange=render;
+el('run').onclick=async()=>{const id=sel.value;const entry=(cat&&cat.commands||[]).find(c=>c.id===id)||{};const payload={id, args:{}};for(const i of args.querySelectorAll('input')){if(i.value)payload.args[i.dataset.name]=i.value}out.textContent='Running...';const r=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json',...auth()},body:JSON.stringify(payload)});const data=await r.json();out.textContent=JSON.stringify(data,null,2)};
+</script>
+HTML
+  }
+
+  # Copy assets from repo if available
+  try_copy_from_repo() {
+    local srcWeb="${SRC}/web/flux-web"
+    local srcEtc="${SRC}/web/flux-web/etc"
+    if [ -d "$srcWeb" ]; then
+      echo "Copying web bundle from ${srcWeb} -> ${WEB}"
+      sudo mkdir -p "$WEB"
+      sudo cp -r "$srcWeb/"* "$WEB/" 2>/dev/null || true
+    fi
+    sudo mkdir -p "$ETC"
+    if [ -f "${srcEtc}/catalog.json" ]; then
+      [ -f "${ETC}/catalog.json" ] || sudo cp "${srcEtc}/catalog.json" "${ETC}/catalog.json"
+    fi
+    if [ -f "${srcEtc}/config.json" ]; then
+      [ -f "${ETC}/config.json" ] || sudo cp "${srcEtc}/config.json" "${ETC}/config.json"
+    fi
+  }
+
+  gen_defaults() {
+    sudo mkdir -p "$ETC"
+    # Create if missing
+    if [ ! -f "${ETC}/config.json" ]; then
+      sudo tee "${ETC}/config.json" >/dev/null <<EOF
+{
+  "token": "REPLACE_WITH_A_LONG_RANDOM_TOKEN",
+  "fluxPath": "/usr/local/bin/flux",
+  "baseDir": "/Server/Applications",
+  "staticDir": "",
+  "bind": "127.0.0.1",
+  "port": ${PORT:-3088}
+}
+EOF
+    else
+      # If --port was provided, update existing config
+      if [ -n "$PORT" ]; then
+        if command -v jq >/dev/null 2>&1; then
+          sudo jq --argjson p ${PORT} '.port=$p' "${ETC}/config.json" | sudo tee "${ETC}/config.json.tmp" >/dev/null
+          sudo mv "${ETC}/config.json.tmp" "${ETC}/config.json"
+        else
+          sudo sed -i.bak "s/\"port\"[[:space:]]*:[[:space:]]*[0-9]\+/\"port\": ${PORT}/" "${ETC}/config.json" || true
+        fi
+      fi
+    fi
+    if [ ! -f "${ETC}/catalog.json" ]; then
+      sudo tee "${ETC}/catalog.json" >/dev/null <<'EOF'
+{
+  "title": "Flux Command Catalog",
+  "version": "v0.6.0",
+  "commands": [
+    {"id":"status","name":"status","desc":"Show proxy and sites status","args":[]},
+    {"id":"list","name":"list","desc":"List all sites","args":[]}
+  ]
+}
+EOF
+    fi
+    # Generate token if placeholder
+    if grep -q "REPLACE_WITH_A_LONG_RANDOM_TOKEN" "${ETC}/config.json"; then
+      local tok; tok="$(tr -dc A-Za-z0-9 </dev/urandom | head -c 40)"
+      if command -v jq >/dev/null 2>&1; then
+        sudo jq --arg t "$tok" '.token=$t' "${ETC}/config.json" | sudo tee "${ETC}/config.json.tmp" >/dev/null
+        sudo mv "${ETC}/config.json.tmp" "${ETC}/config.json"
+      else
+        sudo sed -i.bak "s/REPLACE_WITH_A_LONG_RANDOM_TOKEN/${tok}/" "${ETC}/config.json" || \
+        perl -0777 -pe "s/REPLACE_WITH_A_LONG_RANDOM_TOKEN/${tok}/" -i "${ETC}/config.json"
+      fi
+      echo "Generated API token in ${ETC}/config.json"
+    fi
+    # If --token provided, set it
+    if [ -n "$TOKEN" ]; then
+      if command -v jq >/dev/null 2>&1; then
+        sudo jq --arg t "$TOKEN" '.token=$t' "${ETC}/config.json" | sudo tee "${ETC}/config.json.tmp" >/dev/null
+        sudo mv "${ETC}/config.json.tmp" "${ETC}/config.json"
+      else
+        sudo sed -i.bak "s/\"token\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"token\": \"${TOKEN//\//\\/}\"/" "${ETC}/config.json" || true
+      fi
+      echo "Token set from --token"
+    fi
+  }
+
+  case "$sub" in
+    install)
+      ensure_node || exit 1
+      sudo mkdir -p "$BASE" "$ETC" "$WEB"
+      sudo bash -c "$(declare -f gen_server_js); gen_server_js"
+      # prefer repo UI if present; else minimal
+      sudo bash -c "$(declare -f try_copy_from_repo); try_copy_from_repo"
+      if [ ! -f "${WEB}/index.html" ]; then
+        sudo bash -c "$(declare -f gen_minimal_ui); gen_minimal_ui"
+      fi
+      sudo bash -c "$(declare -f gen_defaults); gen_defaults"
+      # minimal package.json
+      if [ ! -f "$PKG" ]; then
+        sudo tee "$PKG" >/dev/null <<'PKG'
+{
+  "name": "flux-web",
+  "private": true,
+  "version": "0.1.0",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": { "start": "node server.js" },
+  "dependencies": { "express": "^4.19.2" }
+}
+PKG
+      fi
+      (cd "$BASE" && sudo npm i --omit=dev)
+      # systemd service pointing INSIDE BASE
+      sudo tee "$SERVICE" >/dev/null <<UNIT
+[Unit]
+Description=Flux Web (portable)
+After=network-online.target
+Wants=network-online.target
+[Service]
+User=root
+WorkingDirectory=${BASE}
+Environment=FLUX_WEB_CONFIG=${ETC}/config.json
+Environment=FLUX_WEB_CATALOG=${ETC}/catalog.json
+ExecStart=/usr/bin/node ${SERVER}
+Restart=always
+RestartSec=2s
+[Install]
+WantedBy=multi-user.target
+UNIT
+      sudo systemctl daemon-reload
+      sudo systemctl enable --now flux-web
+      echo "Flux Web installed at ${BASE} and started. Use: flux web open --path ${BASE}"
+      ;;
+
+    dev)
+      # Local dev (macOS/Linux) without systemd
+      ensure_node || exit 1
+      mkdir -p "$BASE" "$ETC" "$WEB"
+      [ -f "$SERVER" ] || { gen_server_js; }
+      # prefer repo UI if present; else minimal
+      try_copy_from_repo
+      [ -f "${WEB}/index.html" ] || gen_minimal_ui
+      gen_defaults
+      (cd "$BASE" && { [ -f "$PKG" ] || cat > "$PKG" <<'PKG'
+{
+  "name": "flux-web",
+  "private": true,
+  "version": "0.1.0",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": { "start": "node server.js" },
+  "dependencies": { "express": "^4.19.2" }
+}
+PKG
+      } && npm i --omit=dev && FLUX_WEB_CONFIG="$ETC/config.json" FLUX_WEB_CATALOG="$ETC/catalog.json" PORT="${PORT:-}" node server.js)
+      ;;
+
+    uninstall)
+      sudo systemctl disable --now flux-web 2>/dev/null || true
+      sudo rm -f "$SERVICE"
+      sudo systemctl daemon-reload
+      # If user passed --path, also remove the folder
+      if [ -n "$BASE" ] && [ "$BASE" != "/" ]; then
+        read -r -p "Remove ${BASE}? [y/N] " yn
+        case "$yn" in [Yy]*) sudo rm -rf "$BASE";; esac
+      fi
+      echo "Flux Web uninstalled."
+      ;;
+
+    status)   sudo systemctl status --no-pager flux-web || true ;;
+    start)    sudo systemctl start flux-web ;;
+    stop)     sudo systemctl stop flux-web ;;
+    restart)  sudo systemctl restart flux-web ;;
+    open)
+      local port
+      if command -v jq >/dev/null 2>&1 && [ -f "${ETC}/config.json" ]; then
+        port="$(jq -r '.port // 3088' "${ETC}/config.json" 2>/dev/null || echo 3088)"
+      elif [ -f "${ETC}/config.json" ]; then
+        port="$(grep -Eo '"port"\s*:\s*[0-9]+' "${ETC}/config.json" | awk -F: '{gsub(/[[:space:]]*/,"",$2); print $2}' | head -n1)"
+        port="${port:-3088}"
+      else
+        port=3088
+      fi
+      echo "Open http://127.0.0.1:${port}"
+      ;;
+
+    *)
+      echo "Usage: $PROG web {install|uninstall|status|start|stop|restart|open|dev} [--path DIR] [--port N] [--token TOKEN] [--from REPO_DIR]"
+      exit 1;;
+  esac
+}
+
+# ---------- Scaffolding ----------
+
+cmd_scaffold() {
+  local type="${1:-}"; local name="${2:-}"; shift 2 || true
+  [ -n "$type" ] && [ -n "$name" ] || {
+    echo "Usage: $PROG scaffold <fullstack|static> <name> [--domain DOMAIN] [--api-domain API] [--db mysql|mariadb|postgres|none] [--php] [--up]"
+    exit 1
+  }
+  case "$type" in fullstack|static) ;; *) echo "Type must be one of: fullstack, static"; exit 1;; esac
+
+  # Choose template
+  local tmpl
+  if   [ "$type" = "fullstack" ]; then tmpl="${BASE_DIR}/_templates/site-fullstack.template.json"
+  else                                 tmpl="${BASE_DIR}/_templates/site-static.template.json"
+  fi
+  [ -f "$tmpl" ] || { echo "Template not found: $tmpl"; exit 1; }
+
+  local dir="${BASE_DIR}/${name}"
+  sudo mkdir -p "$dir"
+  sudo cp "$tmpl" "$dir/site.json"
+
+  local domain="" apidomain="" db="" up="no" php="no"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --domain)      domain="${2:-}"; shift;;
+      --api-domain)  apidomain="${2:-}"; shift;;
+      --db)          db="${2:-}"; shift;;         # mysql|mariadb|postgres|none
+      --php)         php="yes";;
+      --up)          up="yes";;
+      *) echo "Unknown option: $1"; exit 1;;
+    esac
+    shift || true
+  done
+
+  # Build jq filter
+  local jqf=".name=\"${name}\" | .localHost=\"${name}.local\" | .type=\"${type}\""
+  [ -n "$domain" ]    && jqf="$jqf | .domain=\"${domain}\""
+  [ -n "$apidomain" ] && jqf="$jqf | .apiDomain=\"${apidomain}\""
+  if [ "$php" = "yes" ] && [ "$type" = "static" ]; then
+    jqf="$jqf | .frontend.php.enabled=true"
+  fi
+
+  if [ -n "$db" ]; then
+    case "$db" in
+      mysql)    jqf="$jqf | .db.engine=\"mysql\"" ;;
+      mariadb)  jqf="$jqf | .db.engine=\"mariadb\"" ;;
+      postgres) jqf="$jqf | .db.engine=\"postgres\"" ;;
+      none)     jqf="$jqf | .db.engine=null" ;;
+      *) echo "Invalid --db value: $db (use mysql|mariadb|postgres|none)"; exit 1;;
+    esac
+  fi
+
+  sudo jq "$jqf" "$dir/site.json" | sudo tee "$dir/site.json.new" >/dev/null
+  sudo mv "$dir/site.json.new" "$dir/site.json"
+  echo "Scaffolded $type site at $dir/site.json"
+
+  if [ "$up" = "yes" ]; then
+    "$0" add "$dir/site.json"
+  fi
+}
+
+cmd_catalog_json() {
+  cat <<'JSON'
+{
+  "title": "Flux Command Catalog",
+  "version": "v0.6.0",
+  "baseDirHint": "/Server/Applications",
+  "commands": [
+    {"id":"status","name":"status","desc":"Show proxy and sites status","args":[]},
+    {"id":"list","name":"list","desc":"List all sites","args":[]},
+    {"id":"reload-proxy","name":"reload-proxy","desc":"Reload nginx-proxy","args":[]},
+    {"id":"init","name":"init","desc":"Initialize proxy + network (one-time)","args":[]},
+    {"id":"add","name":"add","desc":"Add site from site.json","args":[{"name":"siteJson","type":"path","required":true}]},
+    {"id":"update","name":"update","desc":"Update site from site.json","args":[{"name":"siteJson","type":"path","required":true}]},
+    {"id":"remove","name":"remove","desc":"Remove site by name","args":[{"name":"name","type":"string","required":true}]},
+    {"id":"quick-start","name":"quick-start","desc":"Start quick tunnel","args":[{"name":"name","type":"string","required":true}]},
+    {"id":"quick-url","name":"quick-url","desc":"Show quick tunnel URL","args":[{"name":"name","type":"string","required":true}]},
+    {"id":"quick-stop","name":"quick-stop","desc":"Stop quick tunnel","args":[{"name":"name","type":"string","required":true}]},
+    {"id":"scaffold-static","name":"scaffold","desc":"Scaffold static site","args":[{"name":"type","type":"const","value":"static"},{"name":"name","type":"string","required":true}]},
+    {"id":"scaffold-fullstack","name":"scaffold","desc":"Scaffold fullstack site","args":[{"name":"type","type":"const","value":"fullstack"},{"name":"name","type":"string","required":true}]},
+    {"id":"db-create","exec":["db"],"name":"create","desc":"Create DB","args":[{"name":"siteJson","type":"path","required":true}]},
+    {"id":"db-dump","exec":["db"],"name":"dump","desc":"Dump DB","args":[{"name":"siteJson","type":"path","required":true},{"name":"outfile","type":"path","required":true}]},
+    {"id":"db-restore","exec":["db"],"name":"restore","desc":"Restore DB","args":[{"name":"siteJson","type":"path","required":true},{"name":"infile","type":"path","required":true}]},
+    {"id":"db-migrate","exec":["db"],"name":"migrate","desc":"Migrate from remote (direct)","args":[{"name":"host","type":"string","required":true},{"name":"user","type":"string","required":true},{"name":"pass","type":"string","required":true},{"name":"db","type":"string","required":true},{"name":"targetJson","type":"path","required":true}], "flags":[{"name":"port","type":"string","switch":"--port"}]},
+    {"id":"db-migrate-ssh","exec":["db"],"name":"migrate-remote","desc":"Migrate via SSH (dump on remote)","args":[{"name":"mode","type":"const","value":"ssh"},{"name":"ssh","type":"string","required":true},{"name":"srcdb","type":"string","required":true},{"name":"targetJson","type":"path","required":true}], "flags":[{"name":"u","type":"string","switch":"--mysql-user"},{"name":"p","type":"string","switch":"--mysql-pass"},{"name":"sock","type":"string","switch":"--mysql-sock"}]},
+    {"id":"db-migrate-tunnel","exec":["db"],"name":"migrate-remote","desc":"Migrate via SSH tunnel","args":[{"name":"mode","type":"const","value":"tunnel"},{"name":"ssh","type":"string","required":true},{"name":"srcHost","type":"string","required":true},{"name":"targetJson","type":"path","required":true}], "flags":[{"name":"srcUser","type":"string","switch":"--src-user"},{"name":"srcPass","type":"string","switch":"--src-pass"},{"name":"port","type":"string","switch":"--port"}]}
+  ]
+}
+JSON
+}
+
+# ---------- Firewall (unchanged behavior, cleaned) ----------
+
+fw_json_get() { jq -r "$1 // empty" "$2"; }
+cmd_firewall() {
+  local cfg="${1:-}"; shift || true
+  local persist="no"; local dry="no"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --persist) persist="yes";;
+      --dry-run) dry="yes";;
+      *) echo "Unknown option: $1"; exit 1;;
+    esac
+    shift || true
+  done
+  [ -n "$cfg" ] || { echo "Usage: $PROG firewall <firewall.json> [--persist] [--dry-run]"; exit 1; }
+  [ -f "$cfg" ] || { echo "Firewall config not found: $cfg"; exit 1; }
+
+  local br="$(fw_json_get '.bridge_iface' "$cfg")"; [ -z "$br" ] && br="${BRIDGE_NAME}"
+  local wan="$(fw_json_get '.wan_iface' "$cfg")"; [ -z "$wan" ] && wan="$(ip route | awk '/^default/ {print $5; exit}')"
+  local lan_list_json="$(jq -c '.lan_cidrs // ["192.168.2.0/24"]' "$cfg")"
+  local allow_inter="$(fw_json_get '.allow_intercontainer' "$cfg")"; [ -z "$allow_inter" ] && allow_inter="true"
+  local allow_dns="$(fw_json_get '.allow_dns' "$cfg")"; [ -z "$allow_dns" ] && allow_dns="true"
+  local allow_web="$(fw_json_get '.allow_web' "$cfg")"; [ -z "$allow_web" ] && allow_web="true"
+  local allow_cf="$(fw_json_get '.allow_cloudflare_tunnel' "$cfg")"; [ -z "$allow_cf" ] && allow_cf="true"
+  local cf_ports_json="$(jq -c '.cloudflare_tunnel_ports // [7844]' "$cfg")"
+  local extra_tcp_json="$(jq -c '.extra_egress_tcp_ports // []' "$cfg")"
+  local extra_udp_json="$(jq -c '.extra_egress_udp_ports // []' "$cfg")"
+  local drop_to_lan="$(fw_json_get '.drop_to_lan' "$cfg")"; [ -z "$drop_to_lan" ] && drop_to_lan="true"
+  local catch_all_drop="$(fw_json_get '.catch_all_drop' "$cfg")"; [ -z "$catch_all_drop" ] && catch_all_drop="true"
+  local ipv6="$(fw_json_get '.enable_ipv6' "$cfg")"; [ -z "$ipv6" ] && ipv6="false"
+
+  run() { if [ "$dry" = "yes" ]; then echo "$*"; else eval "$@"; fi }
+
+  echo "Applying firewall rules for br=${br}, wan=${wan} (dry-run=${dry}, persist=${persist})"
+
+  run "sudo iptables -D FORWARD -j SITECTL_BRPROXY 2>/dev/null || true"
+  run "sudo iptables -F SITECTL_BRPROXY 2>/dev/null || true"
+  run "sudo iptables -X SITECTL_BRPROXY 2>/dev/null || true"
+  run "sudo iptables -N SITECTL_BRPROXY"
+
+  run "sudo iptables -C FORWARD -i ${wan} -o ${br} -m conntrack --ctstate ESTABLISHED -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD 1 -i ${wan} -o ${br} -m conntrack --ctstate ESTABLISHED -j ACCEPT"
+  run "sudo iptables -I FORWARD 1 -i ${br} -j SITECTL_BRPROXY"
+
+  [ "$allow_inter" = "true" ] && run "sudo iptables -A SITECTL_BRPROXY -i ${br} -o ${br} -j ACCEPT"
+  [ "$allow_dns" = "true" ] && run "sudo iptables -A SITECTL_BRPROXY -i ${br} -o ${wan} -p udp --dport 53 -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT"
+  [ "$allow_dns" = "true" ] && run "sudo iptables -A SITECTL_BRPROXY -i ${br} -o ${wan} -p tcp --dport 53 -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT"
+  [ "$allow_web" = "true" ] && run "sudo iptables -A SITECTL_BRPROXY -i ${br} -o ${wan} -p tcp -m multiport --dports 80,443 -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT"
+
+  if [ "$allow_cf" = "true" ]; then
+    for p in $(echo "$cf_ports_json" | jq -r '.[]'); do
+      run "sudo iptables -A SITECTL_BRPROXY -i ${br} -o ${wan} -p tcp --dport ${p} -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT"
+      run "sudo iptables -A SITECTL_BRPROXY -i ${br} -o ${wan} -p udp --dport ${p} -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT"
+    done
+  fi
+
+  for p in $(echo "$extra_tcp_json" | jq -r '.[]'); do
+    run "sudo iptables -A SITECTL_BRPROXY -i ${br} -o ${wan} -p tcp --dport ${p} -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT"
+  done
+  for p in $(echo "$extra_udp_json" | jq -r '.[]'); do
+    run "sudo iptables -A SITECTL_BRPROXY -i ${br} -o ${wan} -p udp --dport ${p} -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT"
+  done
+
+  if [ "$drop_to_lan" = "true" ]; then
+    for cidr in $(echo "$lan_list_json" | jq -r '.[]'); do
+      run "sudo iptables -A SITECTL_BRPROXY -i ${br} -d ${cidr} -j DROP"
+    done
+  fi
+
+  if [ "$catch_all_drop" = "true" ]; then
+    run "sudo iptables -A SITECTL_BRPROXY -i ${br} -j DROP"
+  fi
+
+  if [ "$ipv6" = "true" ]; then
+    run "sudo ip6tables -D FORWARD -j SITECTL6_BRPROXY 2>/dev/null || true"
+    run "sudo ip6tables -F SITECTL6_BRPROXY 2>/dev/null || true"
+    run "sudo ip6tables -X SITECTL6_BRPROXY 2>/dev/null || true"
+    run "sudo ip6tables -N SITECTL6_BRPROXY"
+    run "sudo ip6tables -C FORWARD -i ${wan} -o ${br} -m conntrack --ctstate ESTABLISHED -j ACCEPT 2>/dev/null || sudo ip6tables -I FORWARD 1 -i ${wan} -o ${br} -m conntrack --ctstate ESTABLISHED -j ACCEPT"
+    run "sudo ip6tables -I FORWARD 1 -i ${br} -j SITECTL6_BRPROXY"
+    [ "$allow_inter" = "true" ] && run "sudo ip6tables -A SITECTL6_BRPROXY -i ${br} -o ${br} -j ACCEPT"
+    [ "$catch_all_drop" = "true" ] && run "sudo ip6tables -A SITECTL6_BRPROXY -i ${br} -j DROP"
+  fi
+
+  if [ "$persist" = "yes" ]; then
+    run "sudo mkdir -p /etc/iptables"
+    run "sudo /sbin/iptables-save | sudo tee /etc/iptables/rules.v4 >/dev/null"
+    [ "$ipv6" = "true" ] && run "sudo /sbin/ip6tables-save | sudo tee /etc/iptables/rules.v6 >/dev/null"
+    run "sudo tee /etc/systemd/system/iptables-restore.service >/dev/null <<'UNIT'
+[Unit]
+Description=Restore iptables and ip6tables rules
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+[Service]
+Type=oneshot
+ExecStart=/sbin/iptables-restore /etc/iptables/rules.v4
+ExecStart=/sbin/ip6tables-restore /etc/iptables/rules.v6
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+UNIT"
+    run "sudo systemctl daemon-reload"
+    run "sudo systemctl enable --now iptables-restore.service"
+    echo "Firewall rules persisted."
+  fi
+
+  echo "Firewall rules applied."
+}
+
+# ---------- DB Helpers ----------
+
+db_container_name() { local cfg="$1"; local n="$(json_get '.name' "$cfg")"; local s="$(safe_id "$n")"; echo "${s}-db"; }
+db_engine()        { local e; e="$(json_get '.db.engine' "$1")"; [ -z "$e" ] && e="mysql"; echo "$e"; }
+
+db_mysql_client() {
+  local cfg="$1"; shift
+  local n="$(json_get '.name' "$cfg")"; local s="$(safe_id "$n")"
+  local net="${s}_internal"
+  if ! sudo docker network inspect "$net" >/dev/null 2>&1; then
+    net="$(sudo docker network ls --format '{{.Name}}' | awk -v n="${s}_internal" '$0 ~ "_" n "$" {print; exit}')"
+    [ -n "$net" ] || { echo "Network ${s}_internal not found"; exit 1; }
+  fi
+  sudo docker run --rm -i --network "$net" --entrypoint mysql mysql:8 --ssl-mode=DISABLED "$@"
+}
+
+db_mariadb_client() {
+  local cfg="$1"; shift
+  local n="$(json_get '.name' "$cfg")"; local s="$(safe_id "$n")"
+  local net="${s}_internal"
+  if ! sudo docker network inspect "$net" >/dev/null 2>&1; then
+    net="$(sudo docker network ls --format '{{.Name}}' | awk -v n="${s}_internal" '$0 ~ "_" n "$" {print; exit}')"
+    [ -n "$net" ] || { echo "Network ${s}_internal not found"; exit 1; }
+  fi
+  sudo docker run --rm -i --network "$net" --entrypoint mariadb mariadb:11 --ssl=0 "$@"
+}
+
+cmd_db_create() {
+  local cfg="$1"; [ -f "$cfg" ] || { echo "Config not found: $cfg"; exit 1; }
+  local tmp; tmp="$(mktemp)"; normalize_config "$cfg" > "$tmp"
+  local engine="$(db_engine "$tmp")"
+  local dbname="$(json_get '.db.name' "$tmp")"
+  local dbuser="$(json_get '.db.user' "$tmp")"
+  local dbpass="$(json_get '.db.password' "$tmp")"
+  local rootpw="$(json_get '.db.rootPassword' "$tmp")"
+  [ -n "$dbname" ] || { echo ".db.name missing"; exit 1; }
+  case "$engine" in
+    mysql|mariadb)
+      local stmt="CREATE DATABASE IF NOT EXISTS \`$dbname\`;"
+      if [ -n "$dbuser" ] && [ -n "$dbpass" ]; then
+        stmt="$stmt CREATE USER IF NOT EXISTS '$dbuser'@'%' IDENTIFIED BY '$dbpass'; GRANT ALL PRIVILEGES ON \`$dbname\`.* TO '$dbuser'@'%'; FLUSH PRIVILEGES;"
+      fi
+      if [ "$engine" = "mysql" ]; then
+        printf "%s" "$stmt" | db_mysql_client "$tmp" -h "$(db_container_name "$tmp")" -uroot "-p${rootpw}"
+      else
+        printf "%s" "$stmt" | db_mariadb_client "$tmp" -h "$(db_container_name "$tmp")" -uroot "-p${rootpw}"
+      fi
+      echo "DB created (engine=$engine, name=$dbname)."
+      ;;
+    *)
+      # TODO(Postgres): add postgres create
+      echo "Engine '$engine' not supported yet for create."; rm -f "$tmp"; exit 1;;
+  esac
+  rm -f "$tmp"
+}
+
+cmd_db_dump() {
+  local cfg="$1" out="${2:-}"
+  [ -n "$out" ] || { echo "Usage: $PROG db dump <site.json> <outfile.sql>"; exit 1; }
+  local tmp; tmp="$(mktemp)"; normalize_config "$cfg" > "$tmp"
+  local engine="$(db_engine "$tmp")"
+  local name="$(json_get '.name' "$tmp")"
+  local dbname="$(json_get '.db.name' "$tmp")"
+  local rootpw="$(json_get '.db.rootPassword' "$tmp")"
+  local n="$(json_get '.name' "$tmp")"; local s="$(safe_id "$n")"
+  case "$engine" in
+    mysql|mariadb)
+      local img="mysql:8"; [ "$engine" = "mariadb" ] && img="mariadb:11"
+      sudo docker run --rm --network "${s}_internal" "$img" \
+          sh -c "mysqldump -h $(db_container_name "$tmp") -uroot -p${rootpw} --routines --triggers --events ${dbname}" > "$out"
+      echo "Dump written to $out"
+      ;;
+    *)
+      # TODO(Postgres): add postgres dump
+      echo "Engine '$engine' dump not supported yet."; rm -f "$tmp"; exit 1;;
+  esac
+  rm -f "$tmp"
+}
+
+cmd_db_restore() {
+  local cfg="$1" infile="$2"
+  [ -f "$cfg" ]   || { echo "Site JSON not found: $cfg"; exit 1; }
+  [ -f "$infile" ]|| { echo "Dump file not found: $infile"; exit 1; }
+
+  local tmp; tmp="$(mktemp)"; normalize_config "$cfg" > "$tmp"
+  local name="$(json_get '.name' "$tmp")"
+  local engine="$(json_get '.db.engine' "$tmp")"
+  local dbname="$(json_get '.db.name' "$tmp")"
+  local rootpw="$(json_get '.db.rootPassword' "$tmp")"
+  [ -n "$dbname" ] && [ "$dbname" != "null" ] || { echo "Database name missing in site.json (.db.name)."; rm -f "$tmp"; exit 1; }
+  [ -n "$rootpw" ] && [ "$rootpw" != "null" ] || { echo "Root password missing in site.json (.db.rootPassword)."; rm -f "$tmp"; exit 1; }
+
+  local host client
+  host="$(db_container_name "$tmp")"
+  client="db_mysql_client"; [ "$engine" = "mariadb" ] && client="db_mariadb_client"
+
+  # Ensure DB exists before import
+  $client "$tmp" -h "$host" -uroot "-p${rootpw}" \
+    -e "CREATE DATABASE IF NOT EXISTS \`${dbname}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+
+  filter_dump() {
+    sed -E \
+      -e '/^[[:space:]]*use[[:space:]]+database[[:space:]]+/Id' \
+      -e 's/DEFINER=`[^`]+`@`[^`]+`[[:space:]]+//gI' \
+      -e 's/SQL[[:space:]]+SECURITY[[:space:]]+DEFINER/SQL SECURITY INVOKER/gI' \
+      -e 's%/\*![0-9]+[[:space:]]+DEFINER=`[^`]+`@`[^`]+`\s*\*/[[:space:]]*%%gI'
+  }
+
+  if [[ "$infile" == *.gz ]]; then
+    gunzip -c "$infile" | filter_dump | $client "$tmp" -h "$host" -uroot "-p${rootpw}" "${dbname}"
+  else
+    filter_dump < "$infile" | $client "$tmp" -h "$host" -uroot "-p${rootpw}" "${dbname}"
+  fi
+
+  echo "Restored ${infile} into ${dbname} (engine=${engine}, site=${name})."
+
+  echo
+  echo "----- Table overview for ${dbname} -----"
+  $client "$tmp" -h "$host" -uroot "-p${rootpw}" -e "
+    SELECT
+      TABLE_NAME   AS 'Table',
+      TABLE_TYPE   AS 'Type',
+      ENGINE       AS 'Engine',
+      TABLE_ROWS   AS 'Approx Rows',
+      ROUND((DATA_LENGTH+INDEX_LENGTH)/1024/1024,2) AS 'Total MB'
+    FROM information_schema.tables
+    WHERE table_schema='${dbname}'
+    ORDER BY TABLE_NAME;
+  "
+
+  echo
+  echo "----- Routines (procedures/functions) in ${dbname} -----"
+  $client "$tmp" -h "$host" -uroot "-p${rootpw}" -e "
+    SELECT ROUTINE_TYPE AS 'Type', ROUTINE_NAME AS 'Name', SECURITY_TYPE AS 'Security'
+    FROM information_schema.ROUTINES
+    WHERE ROUTINE_SCHEMA='${dbname}'
+    ORDER BY ROUTINE_TYPE, ROUTINE_NAME;
+  "
+
+  echo
+  echo "----- Views in ${dbname} -----"
+  $client "$tmp" -h "$host" -uroot "-p${rootpw}" -e "
+    SELECT TABLE_NAME AS 'View'
+    FROM information_schema.VIEWS
+    WHERE TABLE_SCHEMA='${dbname}'
+    ORDER BY TABLE_NAME;
+  "
+  rm -f "$tmp"
+}
+
+cmd_db_migrate() {
+  # Usage: flux db migrate <src_host> <src_user> <src_pass> <src_db> <target_site.json> [--port 3306]
+  [ $# -ge 5 ] || { echo "Usage: $PROG db migrate <src_host> <src_user> <src_pass> <src_db> <target_site.json> [--port 3306]"; exit 1; }
+  local shost="$1" suser="$2" spass="$3" sdb="$4" cfg="$5" port="3306"
+  shift 5 || true
+  [ "${1:-}" = "--port" ] && { port="${2:-3306}"; shift 2; }
+  local tmp; tmp="$(mktemp)"; normalize_config "$cfg" > "$tmp"
+  local dbname="$(json_get '.db.name' "$tmp")"
+  local rootpw="$(json_get '.db.rootPassword' "$tmp")"
+  sudo docker run --rm --network host mysql:8 sh -c "mysqldump -h ${shost} -P ${port} -u${suser} -p${spass} --single-transaction --quick --routines --triggers --events --hex-blob --default-character-set=utf8mb4 --set-gtid-purged=OFF --column-statistics=0 ${sdb}" \
+  | db_mysql_client "$tmp" -h "$(db_container_name "$tmp")" -uroot "-p${rootpw}" "$dbname"
+  echo "Migrated ${sdb}@${shost}:${port} -> ${dbname}."
+  rm -f "$tmp"
+}
+
+cmd_db_migrate_remote_ssh() {
+  # Usage: flux db migrate-remote ssh <ssh_user@host> <src_db> <target.json> [--mysql-user u] [--mysql-pass p] [--mysql-sock /sock]
+  [ $# -ge 3 ] || { echo "Usage: $PROG db migrate-remote ssh <ssh_user@host> <src_db> <target.json> [--mysql-user u] [--mysql-pass p] [--mysql-sock /sock]"; exit 1; }
+  local ssh_host="$1"; local sdb="$2"; local cfg="$3"; shift 3 || true
+  local suser="" spass="" ssock=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --mysql-user) suser="$2"; shift 2;;
+      --mysql-pass) spass="$2"; shift 2;;
+      --mysql-sock) ssock="$2"; shift 2;;
+      *) break;;
+    esac
+  done
+  local tmp; tmp="$(mktemp)"; normalize_config "$cfg" > "$tmp"
+  local dbname="$(json_get '.db.name' "$tmp")"
+  local rootpw="$(json_get '.db.rootPassword' "$tmp")"
+  local dump_cmd="mysqldump --single-transaction --quick --routines --triggers --events --hex-blob --default-character-set=utf8mb4 --set-gtid-purged=OFF --column-statistics=0 ${sdb}"
+  [ -n "$suser" ] && dump_cmd="-u${suser} ${dump_cmd}"
+  [ -n "$spass" ] && dump_cmd="-p${spass} ${dump_cmd}"
+  [ -n "$ssock" ] && dump_cmd="--socket=${ssock} ${dump_cmd}"
+  ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$ssh_host" "$dump_cmd" \
+  | db_mysql_client "$tmp" -h "$(db_container_name "$tmp")" -uroot "-p${rootpw}" "$dbname"
+  echo "Migrated ${sdb} from ${ssh_host} -> ${dbname}."
+  rm -f "$tmp"
+}
+
+cmd_db_migrate_remote_tunnel() {
+  # Usage: flux db migrate-remote tunnel <ssh_user@host> <src_host> <target.json> [--src-user u] [--src-pass p] [--port 3306]
+  [ $# -ge 3 ] || { echo "Usage: $PROG db migrate-remote tunnel <ssh_user@host> <src_host> <target.json> [--src-user u] [--src-pass p] [--port 3306]"; exit 1; }
+  local ssh_host="$1"; local shost="$2"; local cfg="$3"; shift 3 || true
+  local suser="" spass="" port="3306"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --src-user) suser="$2"; shift 2;;
+      --src-pass) spass="$2"; shift 2;;
+      --port)     port="$2"; shift 2;;
+      *) break;;
+    esac
+  done
+  local tmp; tmp="$(mktemp)"; normalize_config "$cfg" > "$tmp"
+  local dbname="$(json_get '.db.name' "$tmp")"
+  local rootpw="$(json_get '.db.rootPassword' "$tmp")"
+  local lport="$(shuf -i 33060-33999 -n1)"
+  ssh -f -N -L "${lport}:${shost}:${port}" "$ssh_host"
+  trap 'lsof -i TCP:'"$lport"' -sTCP:LISTEN -t | xargs -r kill' EXIT
+  sudo docker run --rm --network host mysql:8 sh -c "mysqldump -h 127.0.0.1 -P ${lport} ${suser:+-u${suser}} ${spass:+-p${spass}} --single-transaction --quick --routines --triggers --events --hex-blob --default-character-set=utf8mb4 --set-gtid-purged=OFF --column-statistics=0 ${dbname}" \
+  | db_mysql_client "$tmp" -h "$(db_container_name "$tmp")" -uroot "-p${rootpw}" "$dbname"
+  echo "Migrated via SSH tunnel to ${dbname}."
+  rm -f "$tmp"
+}
+
+# ---------- CLI ----------
+
+usage() {
+  cat <<USAGE
+Usage: $PROG <command> [args]
+
+Core:
+  init                           Create network & start nginx-proxy
+  fresh                          Reset proxy (down + recreate nginx-proxy)
+  setup-tunnel <TOKEN>           Start/replace permanent Cloudflare Tunnel (cloudflared)
+  reload-proxy                   Reload nginx-proxy configuration
+  status                         Show container status
+
+Sites:
+  add <config.json>              Add new site from JSON (compose + vhost rules)
+  update <config.json>           Update existing site from JSON
+  remove <name>                  Remove site's containers and vhost rules
+  list                           List site directories
+
+Quick tunnels (no domain):
+  quick-start <name> [host]      Start trycloudflare tunnel for a site
+  quick-url <name>               Print trycloudflare URL
+  quick-stop <name>              Stop the quick tunnel
+
+Scaffold:
+  scaffold <fullstack|static> <name> [--domain DOMAIN] [--api-domain API] [--db mysql|mariadb|postgres|none] [--php] [--up]
+                                 static: add --php for PHP, add --db for local DB
+
+Firewall:
+  firewall <firewall.json> [--persist] [--dry-run]
+                                 Apply iptables rules from JSON (optionally persist)
+
+Notes:
+  • Put site config at /Server/Applications/<name>/site.json (copied on add/update).
+  • For path-based APIs, set paths.apiPrefixes and (optionally) stripApiPrefix.
+  • For production, add Public Hostnames in your Cloudflare Tunnel -> http://nginx-proxy:80.
+USAGE
+}
+
+main() {
+  ensure_jq
+  local cmd="${1:-}"; shift || true
+
+  case "$cmd" in
+    --version|-v|version) echo "flux ${VERSION}"; exit 0 ;;
+    init)              require docker; ensure_network; init_proxy; echo "Init complete." ;;
+    fresh)             ensure_network; fresh ;;
+    add)               [ $# -ge 1 ] || { usage; exit 1; }; cmd_add_update "$1" "add" ;;
+    update)            [ $# -ge 1 ] || { usage; exit 1; }; cmd_add_update "$1" "update" ;;
+    remove)            [ $# -ge 1 ] || { usage; exit 1; }; cmd_remove "$1" ;;
+    list)              cmd_list ;;
+    quick-start)       [ $# -ge 1 ] || { usage; exit 1; }; cmd_quick_start "$1" "${2:-}" ;;
+    quick-stop)        [ $# -ge 1 ] || { usage; exit 1; }; cmd_quick_stop "$1" ;;
+    quick-url)         [ $# -ge 1 ] || { usage; exit 1; }; cmd_quick_url "$1" ;;
+    reload-proxy)      cmd_reload_proxy ;;
+    web)               cmd_web "$@" ;;
+    catalog-json)      cmd_catalog_json ;;
+
+    db)
+      sub="${1:-}"; shift || true
+      case "$sub" in
+        create)         [ $# -ge 1 ] || { echo "Usage: $PROG db create <site.json>"; exit 1; }; cmd_db_create "$1" ;;
+        dump)           [ $# -ge 2 ] || { echo "Usage: $PROG db dump <site.json> <outfile.sql>"; exit 1; }; cmd_db_dump "$1" "$2" ;;
+        restore)        [ $# -ge 2 ] || { echo "Usage: $PROG db restore <site.json> <infile.sql|.sql.gz>"; exit 1; }; cmd_db_restore "$1" "$2" ;;
+        migrate)        [ $# -ge 5 ] || { echo "Usage: $PROG db migrate <host> <user> <pass> <db> <targetJson> [--port N]"; exit 1; }; cmd_db_migrate "$@" ;;
+        migrate-remote) [ $# -ge 1 ] || { echo "Usage: $PROG db migrate-remote <ssh|tunnel> ..."; exit 1; }
+                        mode="${1:-}"; shift || true
+                        case "$mode" in
+                          ssh)    cmd_db_migrate_remote_ssh "$@" ;;
+                          tunnel) cmd_db_migrate_remote_tunnel "$@" ;;
+                          *) echo "Unknown db migrate-remote mode: $mode"; exit 1;;
+                        esac ;;
+        *) echo "Unknown db subcommand: ${sub:-<none>}"; exit 1 ;;
+      esac
+      ;;
+    status)            cmd_status ;;
+    home)              cmd_home "$@" ;;
+    config)            sub="${1:-}"; shift || true; case "$sub" in show) cmd_config_show ;; set) cmd_config_set "$@" ;; *) echo "Usage: $PROG config {show|set <key> <val>}"; exit 1;; esac ;;
+    firewall)          [ $# -ge 1 ] || { usage; exit 1; }; cmd_firewall "$@" ;;
+    scaffold)          [ $# -ge 2 ] || { usage; exit 1; }; cmd_scaffold "$@" ;;
+    ""|-h|--help|help) usage ;;
+    *) echo "Unknown command: $cmd"; usage; exit 1 ;;
+  esac
+}
+
+main "$@"

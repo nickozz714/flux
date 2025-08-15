@@ -1,0 +1,42 @@
+{
+  "name": "mystatic",
+  "type": "static",
+  "domain": "",
+  "apiDomain": "",
+  "localHost": "mystatic.local",
+  "frontend": {
+    "build": "./site",
+    "image": null,
+    "port": 80,
+    "sedReplacements": [],
+    "generateDockerFile": true,
+    "server": "nginx",
+    "spa": false,
+    "index": "index.html",
+    "php": {
+      "enabled": false,
+      "version": "8.2"
+    },
+    "dotenv": {
+      "mode": "",
+      "source": "",
+      "filename": ".env",
+      "targetDir": "/var/www/html",
+      "vars": {}
+    }
+  },
+  "db": {
+    "engine": "mysql",
+    "name": "mystatic",
+    "user": null,
+    "password": null,
+    "rootPassword": "ChangeMe!",
+    "initSql": "",
+    "version": null
+  },
+  "paths": {
+    "apiPrefixes": [],
+    "stripApiPrefix": false
+  },
+  "useExternalDbOf": ""
+}

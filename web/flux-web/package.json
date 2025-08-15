@@ -1,0 +1,13 @@
+{
+  "name": "flux-web",
+  "private": true,
+  "version": "0.2.0",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
