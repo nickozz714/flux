@@ -1,0 +1,4 @@
+# CODEOWNERS
+# This file makes sure @nickozz714 must review any changes before they are merged.
+
+* @nickozz714
