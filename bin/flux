@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-VERSION="0.6.4 - ALPHA"
+VERSION="0.6.5 - ALPHA"
 PROG="${0##*/}"
 
 BASE_DIR="/Server/Applications"
@@ -383,7 +383,7 @@ YAML
 
 compose_add_frontend() {
   local norm="$1" out="$2" site_dir="$3"
-  local name f_build f_image f_port f_php f_phpver f_server f_spa f_index svc
+  local name f_build f_image f_port f_php f_phpver f_server f_spa f_index svc gen
   name="$(json_get '.name' "$norm")"
   svc="$(safe_id "$name")"
   f_build="$(json_get '.frontend.build' "$norm")"
@@ -394,6 +394,7 @@ compose_add_frontend() {
   f_index="$(json_get '.frontend.index' "$norm")"
   f_php="$(json_get '.frontend.php.enabled' "$norm")"
   f_phpver="$(json_get '.frontend.php.version' "$norm")"
+  gen="$(json_get '.frontend.generateDockerFile' "$norm")"
 
   local domain localHost front_vhost db_engine
   domain="$(json_get '.domain' "$norm")"
@@ -402,14 +403,13 @@ compose_add_frontend() {
   db_engine="$(json_get '.db.engine' "$norm")"
 
   echo "  ${svc}-front:" >> "$out"
-  if [ "$f_php" = "true" ]; then
-    if [ -n "$f_image" ] && [ "$f_image" != "null" ]; then
-      echo "    image: ${f_image}" >> "$out"
-    else
-      echo "    build:" >> "$out"
-      echo "      context: ${f_build}" >> "$out"
-    fi
+
+  # ── Decision: if we generated a Dockerfile, we MUST build from context
+  if [ "$gen" = "true" ]; then
+    echo "    build:" >> "$out"
+    echo "      context: ${f_build}" >> "$out"
   else
+    # No generated Dockerfile: use image if provided, otherwise build
     if [ -n "$f_image" ] && [ "$f_image" != "null" ]; then
       echo "    image: ${f_image}" >> "$out"
     else
@@ -418,12 +418,14 @@ compose_add_frontend() {
     fi
   fi
 
+  # Attach networks (proxy + optional internal DB)
   printf '    networks: [%s' "$NETWORK_NAME" >> "$out"
   if [ -n "$db_engine" ] && [ "$db_engine" != "null" ]; then
     printf ', %s' "${svc}_internal" >> "$out"
   fi
   echo "]" >> "$out"
 
+  # Base compose bits
   cat >> "$out" <<YAML
     container_name: ${svc}-front
     environment:
@@ -432,6 +434,7 @@ compose_add_frontend() {
     restart: unless-stopped
 YAML
 
+  # PHP: mount any *.env files found next to site.json (compose-mode dotenv)
   if [ "$f_php" = "true" ]; then
     local dir; dir="$(cd "${site_dir}" && pwd)"
     mapfile -t env_files < <(find "$dir" -maxdepth 1 -type f -name '*.env' -printf '%f\n' | sort)
