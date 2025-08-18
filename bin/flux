@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-VERSION="0.6.5 - ALPHA"
+VERSION="0.6.6 - ALPHA"
 PROG="${0##*/}"
 
 BASE_DIR="/Server/Applications"
@@ -1366,20 +1366,102 @@ cmd_catalog_json() {
 JSON
 }
 
-# ---------- Firewall (unchanged behavior, cleaned) ----------
+# ---------- Firewall ----------
 
 fw_json_get() { jq -r "$1 // empty" "$2"; }
 cmd_firewall() {
-  local cfg="${1:-}"; shift || true
-  local persist="no"; local dry="no"
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --persist) persist="yes";;
-      --dry-run) dry="yes";;
-      *) echo "Unknown option: $1"; exit 1;;
-    esac
-    shift || true
-  done
+  local sub="${1:-}"; shift || true
+
+  # Helper: JSON getter (already in your script as fw_json_get)
+  # fw_json_get() { jq -r "$1 // empty" "$2"; }
+
+  # Common flags parsing (used by both clean/apply)
+  parse_flags() {
+    persist="no"; dry="no"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --persist) persist="yes";;
+        --dry-run) dry="yes";;
+        *) break;;
+      esac
+      shift || true
+    done
+    REM_ARGS=("$@")
+  }
+
+  # Runner (echo if dry-run)
+  run() { if [ "$dry" = "yes" ]; then echo "$*"; else eval "$@"; fi }
+
+  # -------- CLEAN MODE --------
+  if [ "$sub" = "clean" ]; then
+    parse_flags "$@"
+    local cfg="${REM_ARGS[0]:-}"
+    [ -n "$cfg" ] || { echo "Usage: $PROG firewall clean <firewall.json> [--persist] [--dry-run]"; exit 1; }
+    [ -f "$cfg" ] || { echo "Firewall config not found: $cfg"; exit 1; }
+
+    local br="$(fw_json_get '.bridge_iface' "$cfg")"; [ -z "$br" ] && br="${BRIDGE_NAME}"
+    local wan="$(fw_json_get '.wan_iface' "$cfg")"; [ -z "$wan" ] && wan="$(ip route | awk '/^default/ {print $5; exit}')"
+    local ipv6="$(fw_json_get '.enable_ipv6' "$cfg")"; [ -z "$ipv6" ] && ipv6="false"
+
+    echo "Cleaning Flux firewall rules (br=${br}, wan=${wan}, persist=${persist}, dry-run=${dry})"
+
+    # Remove jump from FORWARD to SITECTL_BRPROXY (may exist multiple times; try until gone)
+    while sudo iptables -C FORWARD -i "${br}" -j SITECTL_BRPROXY 2>/dev/null; do
+      run "sudo iptables -D FORWARD -i ${br} -j SITECTL_BRPROXY"
+    done
+
+    # Remove the WAN->BR established accept rule we inserted (if present)
+    if sudo iptables -C FORWARD -i "${wan}" -o "${br}" -m conntrack --ctstate ESTABLISHED -j ACCEPT 2>/dev/null; then
+      run "sudo iptables -D FORWARD -i ${wan} -o ${br} -m conntrack --ctstate ESTABLISHED -j ACCEPT"
+    fi
+
+    # Flush & delete the chain
+    run "sudo iptables -F SITECTL_BRPROXY 2>/dev/null || true"
+    run "sudo iptables -X SITECTL_BRPROXY 2>/dev/null || true"
+
+    # IPv6 variant if enabled in JSON
+    if [ "$ipv6" = "true" ]; then
+      while sudo ip6tables -C FORWARD -i "${br}" -j SITECTL6_BRPROXY 2>/dev/null; do
+        run "sudo ip6tables -D FORWARD -i ${br} -j SITECTL6_BRPROXY"
+      done
+      run "sudo ip6tables -F SITECTL6_BRPROXY 2>/dev/null || true"
+      run "sudo ip6tables -X SITECTL6_BRPROXY 2>/dev/null || true"
+      if sudo ip6tables -C FORWARD -i "${wan}" -o "${br}" -m conntrack --ctstate ESTABLISHED -j ACCEPT 2>/dev/null; then
+        run "sudo ip6tables -D FORWARD -i ${wan} -o ${br} -m conntrack --ctstate ESTABLISHED -j ACCEPT"
+      fi
+    fi
+
+    if [ "$persist" = "yes" ]; then
+      run "sudo mkdir -p /etc/iptables"
+      run "sudo /sbin/iptables-save | sudo tee /etc/iptables/rules.v4 >/dev/null"
+      [ "$ipv6" = "true" ] && run "sudo /sbin/ip6tables-save | sudo tee /etc/iptables/rules.v6 >/dev/null"
+      # Keep/ensure restore service
+      run "sudo tee /etc/systemd/system/iptables-restore.service >/dev/null <<'UNIT'
+[Unit]
+Description=Restore iptables and ip6tables rules
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+[Service]
+Type=oneshot
+ExecStart=/sbin/iptables-restore /etc/iptables/rules.v4
+ExecStart=/sbin/ip6tables-restore /etc/iptables/rules.v6
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+UNIT"
+      run "sudo systemctl daemon-reload"
+      run "sudo systemctl enable --now iptables-restore.service"
+      echo "Firewall clean slate persisted."
+    fi
+
+    echo "Flux firewall rules cleaned."
+    return
+  fi
+
+  # -------- APPLY MODE (original behavior) --------
+  # Accept legacy invocation: flux firewall <json> [--persist] [--dry-run]
+  local cfg="$sub"
+  parse_flags "$@"
   [ -n "$cfg" ] || { echo "Usage: $PROG firewall <firewall.json> [--persist] [--dry-run]"; exit 1; }
   [ -f "$cfg" ] || { echo "Firewall config not found: $cfg"; exit 1; }
 
@@ -1397,18 +1479,23 @@ cmd_firewall() {
   local catch_all_drop="$(fw_json_get '.catch_all_drop' "$cfg")"; [ -z "$catch_all_drop" ] && catch_all_drop="true"
   local ipv6="$(fw_json_get '.enable_ipv6' "$cfg")"; [ -z "$ipv6" ] && ipv6="false"
 
-  run() { if [ "$dry" = "yes" ]; then echo "$*"; else eval "$@"; fi }
-
   echo "Applying firewall rules for br=${br}, wan=${wan} (dry-run=${dry}, persist=${persist})"
 
-  run "sudo iptables -D FORWARD -j SITECTL_BRPROXY 2>/dev/null || true"
+  # Reset the chain cleanly then recreate
+  run "sudo iptables -D FORWARD -i ${br} -j SITECTL_BRPROXY 2>/dev/null || true"
   run "sudo iptables -F SITECTL_BRPROXY 2>/dev/null || true"
   run "sudo iptables -X SITECTL_BRPROXY 2>/dev/null || true"
   run "sudo iptables -N SITECTL_BRPROXY"
 
-  run "sudo iptables -C FORWARD -i ${wan} -o ${br} -m conntrack --ctstate ESTABLISHED -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD 1 -i ${wan} -o ${br} -m conntrack --ctstate ESTABLISHED -j ACCEPT"
-  run "sudo iptables -I FORWARD 1 -i ${br} -j SITECTL_BRPROXY"
+  # Ensure companion FORWARD rules exist (insert at top if missing)
+  if ! sudo iptables -C FORWARD -i "${wan}" -o "${br}" -m conntrack --ctstate ESTABLISHED -j ACCEPT 2>/dev/null; then
+    run "sudo iptables -I FORWARD 1 -i ${wan} -o ${br} -m conntrack --ctstate ESTABLISHED -j ACCEPT"
+  fi
+  if ! sudo iptables -C FORWARD -i "${br}" -j SITECTL_BRPROXY 2>/dev/null; then
+    run "sudo iptables -I FORWARD 1 -i ${br} -j SITECTL_BRPROXY"
+  fi
 
+  # Populate the chain
   [ "$allow_inter" = "true" ] && run "sudo iptables -A SITECTL_BRPROXY -i ${br} -o ${br} -j ACCEPT"
   [ "$allow_dns" = "true" ] && run "sudo iptables -A SITECTL_BRPROXY -i ${br} -o ${wan} -p udp --dport 53 -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT"
   [ "$allow_dns" = "true" ] && run "sudo iptables -A SITECTL_BRPROXY -i ${br} -o ${wan} -p tcp --dport 53 -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT"
@@ -1433,18 +1520,20 @@ cmd_firewall() {
       run "sudo iptables -A SITECTL_BRPROXY -i ${br} -d ${cidr} -j DROP"
     done
   fi
+  [ "$catch_all_drop" = "true" ] && run "sudo iptables -A SITECTL_BRPROXY -i ${br} -j DROP"
 
-  if [ "$catch_all_drop" = "true" ]; then
-    run "sudo iptables -A SITECTL_BRPROXY -i ${br} -j DROP"
-  fi
-
+  # IPv6 mirrored setup if enabled
   if [ "$ipv6" = "true" ]; then
-    run "sudo ip6tables -D FORWARD -j SITECTL6_BRPROXY 2>/dev/null || true"
+    run "sudo ip6tables -D FORWARD -i ${br} -j SITECTL6_BRPROXY 2>/dev/null || true"
     run "sudo ip6tables -F SITECTL6_BRPROXY 2>/dev/null || true"
     run "sudo ip6tables -X SITECTL6_BRPROXY 2>/dev/null || true"
     run "sudo ip6tables -N SITECTL6_BRPROXY"
-    run "sudo ip6tables -C FORWARD -i ${wan} -o ${br} -m conntrack --ctstate ESTABLISHED -j ACCEPT 2>/dev/null || sudo ip6tables -I FORWARD 1 -i ${wan} -o ${br} -m conntrack --ctstate ESTABLISHED -j ACCEPT"
-    run "sudo ip6tables -I FORWARD 1 -i ${br} -j SITECTL6_BRPROXY"
+    if ! sudo ip6tables -C FORWARD -i "${wan}" -o "${br}" -m conntrack --ctstate ESTABLISHED -j ACCEPT 2>/dev/null; then
+      run "sudo ip6tables -I FORWARD 1 -i ${wan} -o ${br} -m conntrack --ctstate ESTABLISHED -j ACCEPT"
+    fi
+    if ! sudo ip6tables -C FORWARD -i "${br}" -j SITECTL6_BRPROXY 2>/dev/null; then
+      run "sudo ip6tables -I FORWARD 1 -i ${br} -j SITECTL6_BRPROXY"
+    fi
     [ "$allow_inter" = "true" ] && run "sudo ip6tables -A SITECTL6_BRPROXY -i ${br} -o ${br} -j ACCEPT"
     [ "$catch_all_drop" = "true" ] && run "sudo ip6tables -A SITECTL6_BRPROXY -i ${br} -j DROP"
   fi
@@ -1473,6 +1562,64 @@ UNIT"
 
   echo "Firewall rules applied."
 }
+
+cmd_firewall_status() {
+  # Options:
+  #   --raw     : print raw iptables -S output (no prettifying)
+  #   --chains  : only show Flux chains (no FORWARD)
+  local raw="no" only_chains="no"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --raw) raw="yes";;
+      --chains) only_chains="yes";;
+      *) break;;
+    esac
+    shift || true
+  done
+
+  # What we care about
+  local CHAINS=(SITECTL_BRPROXY SITECTL6_BRPROXY)
+  local FORWARD_DUMP
+  if [ "$only_chains" != "yes" ]; then
+    if [ "$raw" = "yes" ]; then
+      sudo iptables -S FORWARD 2>/dev/null || true
+      command -v ip6tables >/dev/null 2>&1 && sudo ip6tables -S FORWARD 2>/dev/null || true
+    else
+      echo "=== FORWARD (IPv4) ==="
+      sudo iptables -S FORWARD 2>/dev/null | nl -ba || true
+      if command -v ip6tables >/dev/null 2>&1; then
+        echo
+        echo "=== FORWARD (IPv6) ==="
+        sudo ip6tables -S FORWARD 2>/dev/null | nl -ba || true
+      fi
+      echo
+    fi
+  fi
+
+  for c in "${CHAINS[@]}"; do
+    if sudo iptables -S "$c" >/dev/null 2>&1; then
+      if [ "$raw" = "yes" ]; then
+        echo "=== $c (IPv4) ==="
+        sudo iptables -S "$c" || true
+      else
+        echo "=== $c (IPv4) ==="
+        sudo iptables -S "$c" | nl -ba || true
+      fi
+      echo
+    fi
+    if command -v ip6tables >/dev/null 2>&1 && sudo ip6tables -S "$c" >/dev/null 2>&1; then
+      if [ "$raw" = "yes" ]; then
+        echo "=== $c (IPv6) ==="
+        sudo ip6tables -S "$c" || true
+      else
+        echo "=== $c (IPv6) ==="
+        sudo ip6tables -S "$c" | nl -ba || true
+      fi
+      echo
+    fi
+  done
+}
+
 
 # ---------- DB Helpers ----------
 
@@ -1768,7 +1915,13 @@ main() {
     status)            cmd_status ;;
     home)              cmd_home "$@" ;;
     config)            sub="${1:-}"; shift || true; case "$sub" in show) cmd_config_show ;; set) cmd_config_set "$@" ;; *) echo "Usage: $PROG config {show|set <key> <val>}"; exit 1;; esac ;;
-    firewall)          [ $# -ge 1 ] || { usage; exit 1; }; cmd_firewall "$@" ;;
+    firewall)
+      [ $# -ge 1 ] || { usage; exit 1; }
+      case "$1" in
+        status) shift; cmd_firewall_status "$@" ;;
+        *)      cmd_firewall "$@" ;;
+      esac
+      ;;
     scaffold)          [ $# -ge 2 ] || { usage; exit 1; }; cmd_scaffold "$@" ;;
     ""|-h|--help|help) usage ;;
     *) echo "Unknown command: $cmd"; usage; exit 1 ;;

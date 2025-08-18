@@ -1,4 +1,8 @@
 # Changelog
+## 2025-08-18 — v0.6.6
+- Added firewall clean option
+- Added firewall status overview option
+- Fixed minor issues in setting up a firewall.
 
 ## 2025-08-15 — v0.6.1
 - Web UI refactor: portable `cmd_web` with self-contained install/development mode.
