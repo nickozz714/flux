@@ -11,7 +11,7 @@
   "cloudflare_tunnel_ports": [
     7844
   ],
-  "extra_egress_tcp_ports": [],
+  "extra_egress_tcp_ports": [3088, 3306],
   "extra_egress_udp_ports": [],
   "drop_to_lan": true,
   "catch_all_drop": true,

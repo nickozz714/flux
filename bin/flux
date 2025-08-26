@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-VERSION="0.6.6 - ALPHA"
+VERSION="0.6.9 - ALPHA"
 PROG="${0##*/}"
 
 BASE_DIR="/Server/Applications"
@@ -20,6 +20,24 @@ REPO_DIR="$REPO_DIR_DEFAULT"
 # ---------- Common Utilities ----------
 
 require() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; exit 1; }; }
+
+# Wait until a container is reachable on proxy_net by name:port from nginx-proxy
+wait_service_ready() {
+  local name="$1" port="$2" timeout="${3:-30}"
+  # use busybox wget inside nginx-proxy (shipped in image) to avoid needing curl
+  local end=$((SECONDS + timeout))
+  while (( SECONDS < end )); do
+    if sudo docker exec nginx-proxy sh -c "wget -qO- http://${name}:${port}/ >/dev/null 2>&1"; then
+      return 0
+    fi
+    sleep 1
+  done
+  # last chance: try just opening TCP (no HTTP)
+  sudo docker exec nginx-proxy sh -c "nc -z -w 1 ${name} ${port}" >/dev/null 2>&1 && return 0
+  echo "WARN: ${name}:${port} not reachable from nginx-proxy after ${timeout}s"
+  return 1
+}
+
 
 # Compose/Docker safe id:
 # - lowercase
@@ -145,25 +163,78 @@ YAML
 }
 
 reload_proxy() {
-  sudo docker exec nginx-proxy nginx -t >/dev/null 2>&1 || { echo "nginx config test failed"; exit 1; }
+  if ! sudo docker exec nginx-proxy nginx -t; then
+    echo "ERROR: nginx config test failed — not reloading."
+    return 1
+  fi
   sudo docker exec nginx-proxy nginx -s reload >/dev/null 2>&1 || true
   echo "nginx-proxy reloaded."
 }
 
+
 fresh() {
-  echo "Stopping and removing nginx-proxy & cloudflared (if present)..."
+  # Flags:
+  #   --include-tunnel     also stop/remove cloudflared (permanent tunnel)
+  #   --recreate-network   drop and recreate the docker network
+  local include_tunnel="no"
+  local recreate_net="no"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --include-tunnel)   include_tunnel="yes" ;;
+      --recreate-network) recreate_net="yes" ;;
+      *) echo "Unknown flag to fresh: $1"; return 1 ;;
+    esac
+    shift || true
+  done
+
+  echo "Stopping and removing nginx-proxy..."
   (cd "${PROXY_DIR}" && sudo docker compose down || true)
-  sudo docker rm -f cloudflared 2>/dev/null || true
+
+  if [ "$include_tunnel" = "yes" ]; then
+    echo "Also stopping/removing cloudflared (permanent tunnel)..."
+    (cd "${PROXY_DIR}" && sudo docker compose -f cloudflared.yml down 2>/dev/null) || true
+    sudo docker rm -f cloudflared 2>/dev/null || true
+  else
+    echo "Keeping cloudflared (permanent tunnel) as-is."
+  fi
+
+  if [ "$recreate_net" = "yes" ]; then
+    echo "Recreating network ${NETWORK_NAME}..."
+    sudo docker network rm "${NETWORK_NAME}" 2>/dev/null || true
+  fi
+
+  # Ensure network exists and bring proxy back
+  ensure_network
   echo "Reinitializing proxy..."
   init_proxy
 }
 
+
 setup_tunnel() {
-  local token="$1"
+  # Usage: flux setup-tunnel <TOKEN> [--recreate] [--logs] [--project NAME]
+  local token="" recreate="no" show_logs="no" project_name="fluxcf"
+
+  # Parse args (token can be first positional; flags optional)
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --recreate) recreate="yes"; shift ;;
+      --logs)     show_logs="yes"; shift ;;
+      --project|-p) project_name="${2:-fluxcf}"; shift 2 ;;
+      *) token="${1:-}"; shift ;;
+    esac
+  done
+  [ -n "$token" ] || { echo "Usage: $PROG setup-tunnel <TOKEN> [--recreate] [--logs] [--project NAME]"; exit 1; }
+
+  ensure_network
   mkdir -p "${PROXY_DIR}"
+
+  # Write the token env file exactly as you did manually
   cat > "${PROXY_DIR}/.env.tunnel" <<EOF
 TUNNEL_TOKEN=${token}
 EOF
+
+  # Write YOUR exact compose file (unchanged command line)
   cat > "${PROXY_DIR}/cloudflared.yml" <<'YAML'
 version: "3.8"
 services:
@@ -172,15 +243,35 @@ services:
     container_name: cloudflared
     restart: unless-stopped
     env_file: [ ./.env.tunnel ]
-    command: tunnel run --protocol http2 --edge-ip-version 4
+    command: --edge-ip-version 4 tunnel run --protocol http2
     networks: [proxy_net]
 networks:
   proxy_net:
     external: true
 YAML
-  (cd "${PROXY_DIR}" && sudo docker compose -f cloudflared.yml up -d)
-  echo "cloudflared (permanent tunnel) started."
+
+  # Compose project name to reduce orphan warnings from nginx-proxy
+  local compose="sudo docker compose -p ${project_name} -f cloudflared.yml"
+
+  # Recreate if asked
+  if [ "$recreate" = "yes" ]; then
+    (cd "${PROXY_DIR}" && $compose down --remove-orphans || true)
+  fi
+
+  # Up (idempotent)
+  (cd "${PROXY_DIR}" && $compose up -d --remove-orphans)
+  echo "cloudflared (permanent tunnel) started (project=${project_name})."
+
+  # Quick sanity + optional logs
+  sudo docker inspect cloudflared >/dev/null 2>&1 || { echo "ERR: cloudflared container not found"; exit 1; }
+  if [ "$show_logs" = "yes" ]; then
+    sudo docker logs -f cloudflared
+  else
+    sudo docker logs -n 80 cloudflared || true
+  fi
 }
+
+
 
 # ---------- Normalization / Paths ----------
 
@@ -521,13 +612,16 @@ write_vhost_rules() {
   mkdir -p "${PROXY_DIR}/vhost.d"
   local hosts=("$localHost"); [ -n "$domain" ] && hosts+=("$domain")
 
-  if [ "$(json_get '.type' "$norm")" = "fullstack" ]; then
-    for host in "${hosts[@]}"; do
-      {
-        echo "${prefixes_json}" | jq -r '.[]' | while read -r prefix; do
-          case "$prefix" in */) : ;; *) prefix="${prefix}/";; esac
-          if [ "$strip" = "true" ]; then
-            cat <<EOP
+  # Build the content once (no reload here; caller will reload after containers are up)
+  for host in "${hosts[@]}"; do
+    local tmp_file="${PROXY_DIR}/vhost.d/.${host}.tmp"
+    : > "$tmp_file"
+
+    if [ "$(json_get '.type' "$norm")" = "fullstack" ]; then
+      echo "${prefixes_json}" | jq -r '.[]' | while read -r prefix; do
+        case "$prefix" in */) : ;; *) prefix="${prefix}/";; esac
+        if [ "$strip" = "true" ]; then
+          cat >> "$tmp_file" <<EOP
 location ${prefix} {
   proxy_pass http://${svc}-api:${a_port}/;
   proxy_set_header Host \$host;
@@ -536,8 +630,8 @@ location ${prefix} {
   proxy_read_timeout 300;
 }
 EOP
-          else
-            cat <<EOP
+        else
+          cat >> "$tmp_file" <<EOP
 location ${prefix} {
   proxy_pass http://${svc}-api:${a_port}${prefix};
   proxy_set_header Host \$host;
@@ -546,30 +640,33 @@ location ${prefix} {
   proxy_read_timeout 300;
 }
 EOP
-          fi
-        done
-      } | sudo tee "${PROXY_DIR}/vhost.d/${host}" >/dev/null
-      echo "Wrote vhost rules: vhost.d/${host}"
-    done
-    reload_proxy
-  fi
+        fi
+      done
+    fi
+
+    # Atomic replace
+    sudo mv "$tmp_file" "${PROXY_DIR}/vhost.d/${host}"
+    echo "Wrote vhost rules: vhost.d/${host}"
+  done
 }
+
 
 
 # ---------- Dockerfile / Dotenv ----------
 
 ensure_frontend_dockerfile() {
   local norm="$1"
-  local type="$(json_get '.type' "$norm")"
-  [ "$type" = "static" ] || return 0
 
+  # Honor generateDockerFile for BOTH static and fullstack sites
   local gen="$(json_get '.frontend.generateDockerFile' "$norm")"
-  [ "$gen" = "true" ] || { echo "generateDockerFile=false (or unset) — skipping Dockerfile generation."; return 0; }
+  [ "$gen" = "true" ] || { echo "generateDockerFile=false — skipping Dockerfile generation."; return 0; }
 
+  # Basics
   local name site_dir
   name="$(json_get '.name' "$norm")"
   site_dir="${BASE_DIR}/${name}"
 
+  # Frontend settings
   local f_build f_server f_spa f_index php_enabled phpver
   f_build="$(json_get '.frontend.build' "$norm")"; [ -z "$f_build" ] && f_build="./"
   f_server="$(json_get '.frontend.server' "$norm")"; [ -z "$f_server" ] && f_server="nginx"
@@ -578,38 +675,64 @@ ensure_frontend_dockerfile() {
   php_enabled="$(json_get '.frontend.php.enabled' "$norm")"; [ -z "$php_enabled" ] && php_enabled="false"
   phpver="$(json_get '.frontend.php.version' "$norm")"; [ -z "$phpver" ] && phpver="8.2"
 
-  local root="${site_dir}/${f_build#./}"
+  # Resolve build root: support absolute or relative paths
+  local root
+  case "$f_build" in
+    /*)  root="$f_build" ;;
+    *)   root="${site_dir}/${f_build#./}" ;;
+  esac
   mkdir -p "$root"
 
+  echo "[$PROG] generateDockerFile=true → (re)generating Dockerfile at: $root"
+
+  # Backup any existing Dockerfile
   if [ -f "${root}/Dockerfile" ]; then
-    echo "Dockerfile already present at ${root}/Dockerfile — not overwriting."
-    return 0
+    local ts; ts="$(date +%Y%m%d-%H%M%S)"
+    mv "${root}/Dockerfile" "${root}/Dockerfile.bak.${ts}" 2>/dev/null || true
+    echo "[$PROG] existing Dockerfile backed up to Dockerfile.bak.${ts}"
   fi
 
   if [ "$php_enabled" = "true" ]; then
+    # PHP/Apache hardened: never echo warnings/notices to responses
     cat >"$root/Dockerfile" <<DOCKER
 FROM php:${phpver}-apache
 
+# Base extensions + Apache bits
 RUN apt-get update \\
  && apt-get install -y --no-install-recommends git zip unzip libzip-dev \\
  && docker-php-ext-install pdo pdo_mysql mysqli zip \\
- && a2enmod rewrite \\
+ && a2enmod rewrite headers \\
  && rm -rf /var/lib/apt/lists/*
 
+# Composer (optional)
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
 WORKDIR /var/www/html
 COPY . /var/www/html/
-RUN sed -i 's/DirectoryIndex .*/DirectoryIndex index.html index.php/' /etc/apache2/mods-enabled/dir.conf
 
-# Production PHP defaults
+# Prefer index.php, keep index.html fallback
+RUN sed -i 's/DirectoryIndex .*/DirectoryIndex index.php index.html/' /etc/apache2/mods-enabled/dir.conf
+
+# Apache quiet + hardened
+RUN set -eux; { \\
+  echo 'ServerSignature Off'; \\
+  echo 'ServerTokens Prod'; \\
+} > /etc/apache2/conf-available/hardening.conf \\
+ && a2enconf hardening
+
+# Production PHP: log only, never display
 RUN set -eux; { \\
   echo 'expose_php=Off'; \\
   echo 'display_errors=Off'; \\
   echo 'display_startup_errors=Off'; \\
+  echo 'html_errors=Off'; \\
   echo 'log_errors=On'; \\
+  echo 'track_errors=Off'; \\
   echo 'error_log=/proc/self/fd/2'; \\
+  echo 'output_buffering=4096'; \\
+  echo 'zend.exception_ignore_args=On'; \\
   echo 'error_reporting=E_ALL & ~E_DEPRECATED & ~E_USER_DEPRECATED & ~E_NOTICE & ~E_WARNING'; \\
+  echo 'cgi.fix_pathinfo=0'; \\
 } > /usr/local/etc/php/conf.d/zz-prod.ini
 
 EXPOSE 80
@@ -660,6 +783,7 @@ EOF
     fi
   fi
 
+  # Create .dockerignore if missing
   if [ ! -f "${root}/.dockerignore" ]; then
     cat > "${root}/.dockerignore" <<'EOF'
 .git
@@ -670,8 +794,10 @@ node_modules
 EOF
   fi
 
-  echo "Generated ${root}/Dockerfile (php=${php_enabled}, server=${f_server}, spa=${f_spa})."
+  echo "[$PROG] Dockerfile generated (php=${php_enabled}, server=${f_server}, spa=${f_spa}) at ${root}"
 }
+
+
 
 ensure_frontend_dotenv() {
   local norm="$1"
@@ -781,37 +907,155 @@ cmd_add_update() {
   [ -n "$name" ] || { echo ".name missing in $cfg"; exit 1; }
   ensure_site_dir "$name"
   cp "$cfg" "${BASE_DIR}/${name}/site.json" 2>/dev/null || true
+
   local norm_file; norm_file="$(mktemp)"; normalize_config "$cfg" > "$norm_file"
 
   ensure_frontend_dockerfile "$norm_file"
   ensure_frontend_dotenv "$norm_file"
   write_site_compose "$cfg"
   apply_front_replacements "$cfg" "${BASE_DIR}/${name}"
-  write_vhost_rules "$norm_file"
 
+  # 1) Bring services up first (so upstreams exist on proxy_net)
   if [ "$mode" = "update" ]; then
     site_up_force "$name"
   else
     site_up "$name"
   fi
+
+  # 2) Wait for front and (if fullstack) api to be reachable from nginx-proxy
+  local svc="$(safe_id "$(json_get '.name' "$norm_file")")"
+  local f_port="$(json_get '.frontend.port' "$norm_file")"; [ -z "$f_port" ] && f_port="80"
+  wait_service_ready "${svc}-front" "$f_port" 30 || true
+
+  if [ "$(json_get '.type' "$norm_file")" = "fullstack" ]; then
+    local a_port="$(json_get '.api.port' "$norm_file")"; [ -z "$a_port" ] && a_port="8080"
+    wait_service_ready "${svc}-api" "$a_port" 30 || true
+  fi
+
+  # 3) Now write vhost rules atomically and reload
+  write_vhost_rules "$norm_file"
+  reload_proxy
+
   connect_to_external_db_network "$cfg"
   rm -f "$norm_file"
   echo "Site ${name} ${mode}d."
 }
 
+
 cmd_remove() {
-  local name="$1"; [ -n "$name" ] || { echo "Usage: $PROG remove <name>"; exit 1; }
-  site_down "$name"
-  local cfg_json="${BASE_DIR}/${name}/site.json"
-  if [ -f "$cfg_json" ]; then
-    local localHost=$(json_get '.localHost' "$cfg_json"); [ -z "$localHost" ] && localHost="${name}.local"
-    local domain=$(json_get '.domain' "$cfg_json")
-    sudo rm -f "${PROXY_DIR}/vhost.d/${localHost}" 2>/dev/null || true
-    [ -n "$domain" ] && sudo rm -f "${PROXY_DIR}/vhost.d/${domain}" 2>/dev/null || true
+  local name="$1"; shift || true
+  [ -n "$name" ] || { echo "Usage: $PROG remove <name> [--keep-data]"; exit 1; }
+
+  local keep_data="no"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --keep-data) keep_data="yes"; shift ;;
+      *) echo "Unknown option to remove: $1"; exit 1 ;;
+    esac
+  done
+
+  # Defaults (respect user overrides)
+  local BASE_DIR="${BASE_DIR:-/Server/Sites}"
+  local PROXY_DIR="${FLUX_PROXY_DIR:-/Server/Applications/_proxy}"
+  local VHOST_DIR="$PROXY_DIR/vhost.d"
+  local CERTS_DIR="$PROXY_DIR/certs"
+  local HTPASS_DIR="$PROXY_DIR/htpasswd"
+
+  local site_dir="${BASE_DIR}/${name}"
+  local cfg_json="${site_dir}/site.json"
+
+  # 1) Collect hostnames BEFORE stopping containers
+  local hosts=""
+  if docker ps --format '{{.Names}}' | grep -q "^${name}-front$"; then
+    hosts="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${name}-front" \
+      | awk -F= '$1=="VIRTUAL_HOST"{print $2}')"
+  elif docker ps --format '{{.Names}}' | grep -q "^${name}-"; then
+    local anyc; anyc="$(docker ps -aqf "name=^${name}-")"
+    [ -n "$anyc" ] && hosts="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$anyc" \
+      | awk -F= '$1=="VIRTUAL_HOST"{print $2}')"
   fi
-  reload_proxy || true
-  echo "Removed site ${name}."
+  if [ -f "$cfg_json" ]; then
+    local localHost domain
+    localHost="$(json_get '.localHost' "$cfg_json")"
+    domain="$(json_get '.domain' "$cfg_json")"
+    [ -n "$localHost" ] && hosts="${hosts:+$hosts,}$localHost"
+    [ -n "$domain" ] && hosts="${hosts:+$hosts,}$domain"
+  fi
+
+  # 2) Stop/remove the app
+  site_down "$name" || true
+  if [ -f "$site_dir/docker-compose.yml" ]; then
+    if [ "$keep_data" = "yes" ]; then
+      (cd "$site_dir" && docker compose -p "$name" down --remove-orphans) || true
+    else
+      (cd "$site_dir" && docker compose -p "$name" down -v --remove-orphans) || true
+    fi
+  fi
+  docker rm -f $(docker ps -aqf "name=^${name}-") 2>/dev/null || true
+
+  # 3) Delete per-host artifacts (vhost.d, htpasswd, certs)
+  IFS=',' read -r -a _H <<<"$hosts"
+  for h in "${_H[@]}"; do
+    h="$(echo "$h" | xargs)"; [ -z "$h" ] && continue
+    sudo rm -f "$VHOST_DIR/$h" 2>/dev/null || true
+    sudo rm -f "$HTPASS_DIR/$h" 2>/dev/null || true
+
+    local hw="${h//\*/_}"
+    sudo rm -rf "$CERTS_DIR/$h" "$CERTS_DIR/$hw" \
+                "$CERTS_DIR/${h}_ecc" "$CERTS_DIR/${hw}_ecc" \
+                "$CERTS_DIR/${h}_rsa" "$CERTS_DIR/${hw}_rsa" 2>/dev/null || true
+    sudo rm -f  "$CERTS_DIR/$h.crt" "$CERTS_DIR/$h.key" "$CERTS_DIR/$h.chain.pem" "$CERTS_DIR/$h.json" \
+                "$CERTS_DIR/$hw.crt" "$CERTS_DIR/$hw.key" "$CERTS_DIR/$hw.chain.pem" "$CERTS_DIR/$hw.json" 2>/dev/null || true
+  done
+
+  # 4) Reload nginx-proxy
+  if docker exec nginx-proxy nginx -t >/dev/null 2>&1; then
+    docker exec nginx-proxy nginx -s reload
+  else
+    echo "WARN: nginx test failed; neutralizing vhost.d/default"
+    if [ -f "$VHOST_DIR/default" ]; then
+      mv "$VHOST_DIR/default" "$VHOST_DIR/.default.$(date +%s).bak"
+      : > "$VHOST_DIR/default"
+    fi
+    if docker exec nginx-proxy nginx -t >/dev/null 2>&1; then
+      docker exec nginx-proxy nginx -s reload
+    else
+      echo "ERROR: nginx still failing. Check snippets in $VHOST_DIR/."
+      return 1
+    fi
+  fi
+
+  if [ "$keep_data" = "yes" ]; then
+    echo "Removed site ${name}, kept volumes (databases intact)."
+  else
+    echo "Removed site ${name}, volumes deleted."
+  fi
 }
+
+cmd_volumes() {
+  echo "== Flux volumes =="
+  # List all volumes with names and mountpoints
+  local vols
+  vols="$(docker volume ls --format '{{.Name}}: {{.Mountpoint}}')"
+  if [ -z "$vols" ]; then
+    echo "No Docker volumes found."
+    return
+  fi
+
+  # Group by site name (prefix before '-db' etc)
+  echo "$vols" | while IFS=: read -r vname vpath; do
+    vname="$(echo "$vname" | xargs)"
+    vpath="$(echo "$vpath" | xargs)"
+    if [[ "$vname" =~ (.+)_db-data$ ]]; then
+      echo "Site: ${BASH_REMATCH[1]}  →  Volume: $vname"
+      echo "    Path: $vpath"
+    elif [[ "$vname" == "db-data" ]]; then
+      echo "Shared volume: $vname"
+      echo "    Path: $vpath"
+    fi
+  done
+}
+
 
 cmd_list() { ls -1 "${BASE_DIR}" | sed -n '/^_proxy$/!p'; }
 
@@ -911,13 +1155,16 @@ cmd_web() {
   local sub="${1:-}"; shift || true
 
   # ---------- Portable defaults ----------
-  local BASE="/opt/flux-web" PORT="" TOKEN="" SRC=""
+  local BASE="/opt/flux-web" PORT="" TOKEN="" SRC="" BIND="" CATALOG="" USE_REPO_UI="no"
   while [ $# -gt 0 ]; do
     case "$1" in
-      --path)   BASE="$2"; shift 2 ;;
-      --port)   PORT="$2"; shift 2 ;;
-      --token)  TOKEN="$2"; shift 2 ;;
-      --from)   SRC="$2";  shift 2 ;;   # repo root (auto-detected if not provided)
+      --path)     BASE="$2"; shift 2 ;;
+      --port)     PORT="$2"; shift 2 ;;
+      --token)    TOKEN="$2"; shift 2 ;;
+      --from)     SRC="$2";  shift 2 ;;   # repo root (auto-detected if not provided)
+      --bind)     BIND="$2"; shift 2 ;;   # explicit bind address
+      --catalog)  CATALOG="$2"; shift 2 ;;# explicit catalog path
+      --use-repo-ui) USE_REPO_UI="yes"; shift ;; # copy UI bundle from repo
       *) break ;;
     esac
   done
@@ -935,6 +1182,7 @@ cmd_web() {
     [ -d "$guess" ] && SRC="$guess"
   fi
 
+  # ---------- Helpers ----------
   ensure_node() {
     if ! command -v node >/dev/null 2>&1; then
       echo "Node.js not found. Install Node (e.g., apt-get install -y nodejs npm or brew install node)."; return 1
@@ -944,14 +1192,28 @@ cmd_web() {
     fi
   }
 
-  # ---------- Generate robust server.js (portable) ----------
+  # Return a likely LAN IPv4 (RFC1918) or empty on failure
+  detect_lan_ip() {
+    local ip
+    ip="$(ip route get 1.1.1.1 2>/dev/null | awk '/src /{for(i=1;i<=NF;i++){if($i=="src"){print $(i+1); exit}}}')"
+    [ -n "$ip" ] || ip="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9.]+' | grep -v '^127\.' | head -n1)"
+    case "$ip" in 10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) echo "$ip";; *) echo "";; esac
+  }
+
+  # Generate robust server.js (portable)
+  # Generate robust server.js (ES2018-compatible; tokenless by default)
   gen_server_js() {
-    cat > "$SERVER" <<'JS'
-// Portable Flux Web server
+    sudo tee "$SERVER" >/dev/null <<'JS'
+// Flux Web server (ES2018-compatible, tokenless-by-default)
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const { spawn } = require('child_process');
+
+function readJsonSafe(file, fallback) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch (e) { console.warn('[flux-web] note:', e.message); return fallback; }
+}
 
 const LOCAL_ETC = path.resolve(process.cwd(), 'etc');
 const defaultConfigPath = fs.existsSync(path.join(LOCAL_ETC, 'config.json'))
@@ -964,223 +1226,324 @@ const defaultCatalogPath = fs.existsSync(path.join(LOCAL_ETC, 'catalog.json'))
 const CONFIG_PATH = process.env.FLUX_WEB_CONFIG || defaultConfigPath;
 const CATALOG_PATH = process.env.FLUX_WEB_CATALOG || defaultCatalogPath;
 
-function safeJson(file, fallback) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
-  catch (e) { console.warn(`[flux-web] Note: cannot read ${file}: ${e.message}`); return fallback; }
-}
-
-let config = safeJson(CONFIG_PATH, {
-  token: 'REPLACE_WITH_A_LONG_RANDOM_TOKEN',
+var config = readJsonSafe(CONFIG_PATH, {
+  auth: 'none',                  // 'none' | 'token'
+  token: '',
   fluxPath: '/usr/local/bin/flux',
   baseDir: '/Server/Applications',
-  staticDir: '', // empty -> use ./web if present
+  staticDir: '',
   bind: '127.0.0.1',
   port: 3088
 });
-let catalog = safeJson(CATALOG_PATH, { title: 'Flux Command Catalog', version: 'dev', commands: [] });
+var catalog = readJsonSafe(CATALOG_PATH, { title: 'Flux Command Catalog', version: 'dev', commands: [] });
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
 function auth(req, res, next) {
-  const h = req.headers['authorization'] || '';
-  const viaAuth = h.startsWith('Bearer ') ? h.slice(7) : '';
-  const viaHeader = req.headers['x-flux-token'] || '';
-  const token = viaAuth || viaHeader || '';
-  const isLocal = (req.ip === '127.0.0.1' || req.ip === '::1' || (req.ip||'').endsWith('::1'));
-  if (!config.token || config.token === 'REPLACE_WITH_A_LONG_RANDOM_TOKEN') {
-    if (isLocal) return next();
-    return res.status(403).json({ error: 'Token not set. Edit config.json or send Authorization: Bearer <token>' });
-  }
+  if (String(config.auth || 'none') === 'none') return next();
+  var h = req.headers['authorization'] || '';
+  var viaAuth = (h.indexOf('Bearer ') === 0) ? h.slice(7) : '';
+  var viaHeader = req.headers['x-flux-token'] || '';
+  var token = viaAuth || viaHeader || '';
+  if (!config.token) return res.status(403).json({ error: 'Token not set' });
   if (token !== config.token) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
 
-app.get('/api/ping', (req, res) => res.json({ ok: true, version: catalog.version || 'n/a' }));
-app.get('/api/catalog', auth, (req, res) => res.json({ title: catalog.title, version: catalog.version, commands: catalog.commands || [] }));
+app.get('/api/ping', function(req, res) {
+  res.json({ ok: true, version: catalog.version || 'n/a' });
+});
+
+app.get('/api/catalog', auth, function(req, res) {
+  res.json({ title: catalog.title, version: catalog.version, commands: catalog.commands || [] });
+});
 
 function buildArgv(entry, body) {
-  const argv = [];
-  if (Array.isArray(entry.exec)) argv.push(...entry.exec);
+  var argv = [];
+  if (entry.exec && Array.isArray(entry.exec)) {
+    for (var i = 0; i < entry.exec.length; i++) argv.push(String(entry.exec[i]));
+  }
   argv.push(entry.name);
-  for (const a of (entry.args || [])) {
+
+  var argsArr = (entry.args && Array.isArray(entry.args)) ? entry.args : [];
+  var bodyArgs = (body && body.args) ? body.args : {};
+  for (var j = 0; j < argsArr.length; j++) {
+    var a = argsArr[j];
     if (a.type === 'const') { argv.push(String(a.value)); continue; }
-    const v = body.args?.[a.name];
-    if (a.required && (v === undefined || v === null || v === '')) throw new Error(`Missing required arg: ${a.name}`);
+    var v = bodyArgs[a.name];
+    if (a.required && (v === undefined || v === null || v === '')) {
+      throw new Error('Missing required arg: ' + a.name);
+    }
     if (v !== undefined && v !== null && v !== '') argv.push(String(v));
   }
-  for (const f of (entry.flags || [])) {
-    const v = body.flags?.[f.name];
-    if (v !== undefined && v !== null && v !== '') {
-      argv.push(String(f.switch || `--${f.name}`), String(v));
+
+  var flagsArr = (entry.flags && Array.isArray(entry.flags)) ? entry.flags : [];
+  var bodyFlags = (body && body.flags) ? body.flags : {};
+  for (var k = 0; k < flagsArr.length; k++) {
+    var f = flagsArr[k];
+    var fv = bodyFlags[f.name];
+    if (fv !== undefined && fv !== null && fv !== '') {
+      argv.push(String(f.switch || ('--' + f.name)), String(fv));
     }
   }
-  if (Array.isArray(body.rawArgs)) argv.push(...body.rawArgs.map(String));
+
+  if (body && Array.isArray(body.rawArgs)) {
+    for (var r = 0; r < body.rawArgs.length; r++) argv.push(String(body.rawArgs[r]));
+  }
   return argv;
 }
 
-app.post('/api/run', auth, (req, res) => {
+app.post('/api/run', auth, function(req, res) {
   try {
-    const { id } = req.body || {};
+    var body = req.body || {};
+    var id = body.id;
     if (!id) return res.status(400).json({ error: 'Missing id' });
-    const entry = (catalog.commands || []).find(c => c.id === id);
+    var commands = catalog.commands || [];
+    var entry = null;
+    for (var i = 0; i < commands.length; i++) {
+      if (commands[i].id === id) { entry = commands[i]; break; }
+    }
     if (!entry) return res.status(404).json({ error: 'Unknown command id' });
 
-    const argv = buildArgv(entry, req.body || {});
-    const fluxBin = config.fluxPath || '/usr/local/bin/flux';
-    const child = spawn(fluxBin, argv, { env: process.env });
+    var argv = buildArgv(entry, body);
+    var fluxBin = config.fluxPath || '/usr/local/bin/flux';
+    var child = spawn(fluxBin, argv, { env: process.env });
 
-    let stdout = '', stderr = '';
-    child.stdout.on('data', d => stdout += d.toString());
-    child.stderr.on('data', d => stderr += d.toString());
-    child.on('close', code => res.json({ code, stdout, stderr, argv: [fluxBin, ...argv] }));
+    var stdout = '', stderr = '';
+    child.stdout.on('data', function(d) { stdout += String(d); });
+    child.stderr.on('data', function(d) { stderr += String(d); });
+    child.on('close', function(code) {
+      res.json({ code: code, stdout: stdout, stderr: stderr, argv: [fluxBin].concat(argv) });
+    });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
 });
 
 // Static UI (config.staticDir > ./web)
-const staticDir = config.staticDir && config.staticDir.length
+var staticDir = (config.staticDir && String(config.staticDir).length > 0)
   ? config.staticDir
   : (fs.existsSync(path.resolve(process.cwd(), 'web')) ? path.resolve(process.cwd(), 'web') : '');
 if (staticDir) app.use(express.static(staticDir, { extensions: ['html'] }));
 
-// Friendly fallback instead of "Cannot GET /"
-app.get('*', (req, res) => {
+// Friendly fallback
+app.get('*', function(req, res) {
   if (staticDir) return res.status(404).send('Not found');
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.end(`<!doctype html><meta charset="utf-8"><title>Flux Web</title>
-  <h1>Flux Web</h1><p>No UI bundle found. API is available:</p>
-  <ul><li>GET /api/ping</li><li>GET /api/catalog (auth)</li><li>POST /api/run (auth)</li></ul>
-  <p>Put config in ./etc, UI in ./web, or set FLUX_WEB_CONFIG / FLUX_WEB_CATALOG env vars.</p>`);
+  res.end('<!doctype html><meta charset="utf-8"><title>Flux Web</title>\
+  <h1>Flux Web</h1><p>UI missing. API available:</p>\
+  <ul><li>GET /api/ping</li><li>GET /api/catalog</li><li>POST /api/run</li></ul>');
 });
 
-const bind = config.bind || '127.0.0.1';
-const port = Number(process.env.PORT || config.port || 3088);
-app.listen(port, bind, () => {
-  console.log(`[flux-web] http://${bind}:${port}`);
-  console.log(`[flux-web] staticDir=${staticDir || '(none)'} config=${CONFIG_PATH} catalog=${CATALOG_PATH}`);
+var bind = config.bind || '127.0.0.1';
+var port = Number(process.env.PORT || config.port || 3088);
+app.listen(port, bind, function() {
+  console.log('[flux-web] http://' + bind + ':' + port);
+  console.log('[flux-web] staticDir=' + (staticDir || '(none)') + ' config=' + CONFIG_PATH + ' catalog=' + CATALOG_PATH);
 });
 JS
   }
 
+
+  # Ready-to-use minimal UI (no token needed when auth=none)
   gen_minimal_ui() {
-    mkdir -p "$WEB"
-    cat > "${WEB}/index.html" <<'HTML'
+    sudo mkdir -p "$WEB"
+    sudo tee "${WEB}/index.html" >/dev/null <<'HTML'
 <!doctype html><meta charset="utf-8"><title>Flux Web</title>
-<style>body{font-family:system-ui;margin:2rem;line-height:1.45}pre{background:#0b1020;color:#e7ecff;padding:12px;border-radius:10px;max-height:50vh;overflow:auto}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.card{border:1px solid #dcdfe6;border-radius:12px;padding:12px;margin:12px 0;background:#fafbff}</style>
-<h1>Flux Web (Minimal)</h1>
+<style>
+  :root{--bg:#0b1020;--fg:#e7ecff;--card:#fafbff;--line:#dcdfe6}
+  body{font-family:system-ui,Segoe UI,Roboto;max-width:980px;margin:4vh auto;padding:0 20px;line-height:1.45}
+  h1{margin:0 0 12px} .muted{color:#666}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .card{border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin:14px 0;background:var(--card)}
+  select,input,button{padding:8px 10px;border:1px solid var(--line);border-radius:10px}
+  button{cursor:pointer}
+  pre{background:var(--bg);color:var(--fg);padding:12px;border-radius:10px;max-height:55vh;overflow:auto}
+  .pill{display:inline-block;background:#eef3ff;border:1px solid #d8e1ff;padding:2px 8px;border-radius:999px;margin-left:8px;font-size:12px}
+</style>
+<h1>Flux Web <span id="ver" class="pill">loading…</span></h1>
+<p class="muted">Kant‑en‑klaar: selecteer een commando, vul optionele argumenten in, klik <b>Run</b>.</p>
+
 <div class="card">
-  <button id="load">Load Catalog</button>
-  <input id="token" placeholder="Token (from etc/config.json)" size="48">
-  <select id="cmd" style="min-width:360px"></select>
-  <button id="run">Run</button>
+  <div class="row" style="margin-bottom:8px">
+    <button id="load">Load Catalog</button>
+    <select id="cmd" style="min-width:380px"></select>
+    <button id="run">Run</button>
+  </div>
   <div id="args" class="row"></div>
 </div>
-<div class="card"><h3>Result</h3><pre id="out"></pre></div>
+
+<div class="card"><h3>Result</h3><pre id="out">{ "hint": "Click Load Catalog, pick a command, then Run." }</pre></div>
+
 <script>
-const el=id=>document.getElementById(id); const out=el('out'),sel=el('cmd'),args=el('args');
+const el=id=>document.getElementById(id);
+const out=el('out'), sel=el('cmd'), args=el('args'), ver=el('ver');
 let cat=null;
-const auth=()=>{const t=el('token').value.trim();return t?{'Authorization':'Bearer '+t}:{}};
-el('load').onclick=async()=>{out.textContent='Loading...';const r=await fetch('/api/catalog',{headers:auth()});if(!r.ok){out.textContent='Error '+r.status+' '+await r.text();return}cat=await r.json();sel.innerHTML='';for(const c of cat.commands){const o=document.createElement('option');o.value=c.id;o.textContent=c.id+' — '+(c.desc||'');sel.appendChild(o)}out.textContent='Loaded '+cat.commands.length+' commands';render()};
-function render(){args.innerHTML='';const id=sel.value;const entry=(cat&&cat.commands||[]).find(c=>c.id===id);if(!entry)return;for(const a of (entry.args||[])){if(a.type==='const')continue;const i=document.createElement('input');i.placeholder=a.name+(a.required?' *':'');i.dataset.name=a.name;i.size=30;args.appendChild(i)}}
+
+async function ping(){
+  try {
+    const r = await fetch('/api/ping');
+    const j = await r.json(); ver.textContent = j.version || 'n/a';
+  } catch(e){ ver.textContent='offline'; }
+}
+
+const headers = {}; // no token needed (auth=none)
+
+el('load').onclick=async()=>{
+  out.textContent='Loading catalog...';
+  const r=await fetch('/api/catalog',{headers});
+  if(!r.ok){ out.textContent='Error '+r.status+' '+await r.text(); return }
+  cat=await r.json();
+  sel.innerHTML=''; (cat.commands||[]).forEach(c=>{
+    const o=document.createElement('option'); o.value=c.id; o.textContent=(c.id+' — '+(c.desc||'')); sel.appendChild(o);
+  });
+  out.textContent='Loaded '+(cat.commands||[]).length+' commands';
+  render();
+};
+
+function render(){
+  args.innerHTML='';
+  const id=sel.value; const entry=(cat&&cat.commands||[]).find(c=>c.id===id); if(!entry) return;
+  (entry.args||[]).forEach(a=>{
+    if(a.type==='const') return;
+    const w=document.createElement('div'); w.style.display='flex'; w.style.gap='6px'; w.style.alignItems='center';
+    const i=document.createElement('input'); i.placeholder=(a.name+(a.required?' *':'')); i.dataset.name=a.name; i.size=32;
+    w.appendChild(i);
+    args.appendChild(w);
+  });
+}
+
 sel.onchange=render;
-el('run').onclick=async()=>{const id=sel.value;const entry=(cat&&cat.commands||[]).find(c=>c.id===id)||{};const payload={id, args:{}};for(const i of args.querySelectorAll('input')){if(i.value)payload.args[i.dataset.name]=i.value}out.textContent='Running...';const r=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json',...auth()},body:JSON.stringify(payload)});const data=await r.json();out.textContent=JSON.stringify(data,null,2)};
+
+el('run').onclick=async()=>{
+  const id=sel.value; const entry=(cat&&cat.commands||[]).find(c=>c.id===id)||{};
+  const payload={id, args:{}, flags:{}};
+  args.querySelectorAll('input').forEach(i=>{ if(i.value) payload.args[i.dataset.name]=i.value });
+  out.textContent='Running...';
+  const r=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json',...headers},body:JSON.stringify(payload)});
+  const data=await r.json(); out.textContent=JSON.stringify(data,null,2);
+};
+
+ping();
 </script>
 HTML
   }
 
-  # Copy assets from repo if available
+
+  # Copy catalog/config; prefer repo web_config/; UI bundle only with --use-repo-ui
   try_copy_from_repo() {
-    local srcWeb="${SRC}/web/flux-web"
-    local srcEtc="${SRC}/web/flux-web/etc"
-    if [ -d "$srcWeb" ]; then
-      echo "Copying web bundle from ${srcWeb} -> ${WEB}"
-      sudo mkdir -p "$WEB"
-      sudo cp -r "$srcWeb/"* "$WEB/" 2>/dev/null || true
-    fi
+    [ -n "$SRC" ] || return 0
     sudo mkdir -p "$ETC"
-    if [ -f "${srcEtc}/catalog.json" ]; then
-      [ -f "${ETC}/catalog.json" ] || sudo cp "${srcEtc}/catalog.json" "${ETC}/catalog.json"
+
+    # Preferred catalog locations (in order)
+    local cand=()
+    [ -n "$CATALOG" ] && cand+=("$CATALOG")
+    cand+=(
+      "$SRC/web_config/catalog.json"
+      "$SRC/web/flux-web/etc/catalog.json"
+      "$SRC/web/catalog.json"
+      "$SRC/etc/catalog.json"
+    )
+
+    local picked=""
+    for f in "${cand[@]}"; do
+      if [ -f "$f" ]; then picked="$f"; break; fi
+    done
+    if [ -n "$picked" ]; then
+      sudo cp -f "$picked" "${ETC}/catalog.json"
+      echo "[web] Copied catalog from: $picked"
     fi
-    if [ -f "${srcEtc}/config.json" ]; then
-      [ -f "${ETC}/config.json" ] || sudo cp "${srcEtc}/config.json" "${ETC}/config.json"
+
+    # Seed config if a repo template exists, but never overwrite an existing server config
+    local cfgcand=(
+      "$SRC/web_config/config.example.json"
+      "$SRC/web/flux-web/etc/config.json"
+      "$SRC/etc/config.json"
+    )
+    if [ ! -f "${ETC}/config.json" ]; then
+      for f in "${cfgcand[@]}"; do
+        if [ -f "$f" ]; then sudo cp "$f" "${ETC}/config.json"; echo "[web] Seeded config from: $f"; break; fi
+      done
+    fi
+
+    # UI bundle is opt-in
+    if [ "$USE_REPO_UI" = "yes" ]; then
+      local srcWeb=""
+      if   [ -d "$SRC/web/flux-web" ]; then srcWeb="$SRC/web/flux-web"
+      elif [ -d "$SRC/web" ]; then          srcWeb="$SRC/web"
+      fi
+      if [ -n "$srcWeb" ]; then
+        echo "[web] Copying UI bundle from ${srcWeb} -> ${WEB}"
+        sudo mkdir -p "$WEB"
+        sudo rsync -a --delete "$srcWeb"/ "$WEB"/
+      fi
     fi
   }
 
+  # Create/update etc/config.json and etc/catalog.json; auth=none by default; auto-bind LAN
   gen_defaults() {
     sudo mkdir -p "$ETC"
-    # Create if missing
+    local detected bind_to
+    detected="$(detect_lan_ip)"
+    bind_to="${BIND:-$detected}"
+    [ -n "$bind_to" ] || bind_to="127.0.0.1"
+
     if [ ! -f "${ETC}/config.json" ]; then
       sudo tee "${ETC}/config.json" >/dev/null <<EOF
 {
-  "token": "REPLACE_WITH_A_LONG_RANDOM_TOKEN",
+  "auth": "none",
+  "token": "",
   "fluxPath": "/usr/local/bin/flux",
   "baseDir": "/Server/Applications",
   "staticDir": "",
-  "bind": "127.0.0.1",
+  "bind": "${bind_to}",
   "port": ${PORT:-3088}
 }
 EOF
+      echo "[web] Wrote new config (auth=none) bind=${bind_to}, port=${PORT:-3088}"
     else
-      # If --port was provided, update existing config
-      if [ -n "$PORT" ]; then
-        if command -v jq >/dev/null 2>&1; then
-          sudo jq --argjson p ${PORT} '.port=$p' "${ETC}/config.json" | sudo tee "${ETC}/config.json.tmp" >/dev/null
-          sudo mv "${ETC}/config.json.tmp" "${ETC}/config.json"
-        else
-          sudo sed -i.bak "s/\"port\"[[:space:]]*:[[:space:]]*[0-9]\+/\"port\": ${PORT}/" "${ETC}/config.json" || true
-        fi
+      if command -v jq >/dev/null 2>&1; then
+        [ -n "$BIND" ] && sudo jq --arg b "$BIND" '.bind=$b' "${ETC}/config.json" | sudo tee "${ETC}/config.json.tmp" >/dev/null && sudo mv "${ETC}/config.json.tmp" "${ETC}/config.json"
+        [ -n "$PORT" ] && sudo jq --argjson p ${PORT} '.port=$p' "${ETC}/config.json" | sudo tee "${ETC}/config.json.tmp" >/dev/null && sudo mv "${ETC}/config.json.tmp" "${ETC}/config.json"
+        # default to auth=none if not set
+        sudo jq 'if (.auth|type!="string") then .auth="none" else . end | if (.token==null) then .token="" else . end' "${ETC}/config.json" | sudo tee "${ETC}/config.json.tmp" >/dev/null && sudo mv "${ETC}/config.json.tmp" "${ETC}/config.json"
+      else
+        : # keep existing; optional sed updates skipped for brevity
       fi
     fi
+
     if [ ! -f "${ETC}/catalog.json" ]; then
       sudo tee "${ETC}/catalog.json" >/dev/null <<'EOF'
 {
   "title": "Flux Command Catalog",
-  "version": "v0.6.0",
+  "version": "v0.6.7",
   "commands": [
     {"id":"status","name":"status","desc":"Show proxy and sites status","args":[]},
-    {"id":"list","name":"list","desc":"List all sites","args":[]}
+    {"id":"list","name":"list","desc":"List all sites","args":[]},
+    {"id":"reload-proxy","name":"reload-proxy","desc":"Reload nginx-proxy","args":[]},
+    {"id":"init","name":"init","desc":"Initialize proxy + network (one-time)","args":[]}
   ]
 }
 EOF
-    fi
-    # Generate token if placeholder
-    if grep -q "REPLACE_WITH_A_LONG_RANDOM_TOKEN" "${ETC}/config.json"; then
-      local tok; tok="$(tr -dc A-Za-z0-9 </dev/urandom | head -c 40)"
-      if command -v jq >/dev/null 2>&1; then
-        sudo jq --arg t "$tok" '.token=$t' "${ETC}/config.json" | sudo tee "${ETC}/config.json.tmp" >/dev/null
-        sudo mv "${ETC}/config.json.tmp" "${ETC}/config.json"
-      else
-        sudo sed -i.bak "s/REPLACE_WITH_A_LONG_RANDOM_TOKEN/${tok}/" "${ETC}/config.json" || \
-        perl -0777 -pe "s/REPLACE_WITH_A_LONG_RANDOM_TOKEN/${tok}/" -i "${ETC}/config.json"
-      fi
-      echo "Generated API token in ${ETC}/config.json"
-    fi
-    # If --token provided, set it
-    if [ -n "$TOKEN" ]; then
-      if command -v jq >/dev/null 2>&1; then
-        sudo jq --arg t "$TOKEN" '.token=$t' "${ETC}/config.json" | sudo tee "${ETC}/config.json.tmp" >/dev/null
-        sudo mv "${ETC}/config.json.tmp" "${ETC}/config.json"
-      else
-        sudo sed -i.bak "s/\"token\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"token\": \"${TOKEN//\//\\/}\"/" "${ETC}/config.json" || true
-      fi
-      echo "Token set from --token"
+      echo "[web] Wrote default catalog.json"
     fi
   }
+
 
   case "$sub" in
     install)
       ensure_node || exit 1
       sudo mkdir -p "$BASE" "$ETC" "$WEB"
-      sudo bash -c "$(declare -f gen_server_js); gen_server_js"
-      # prefer repo UI if present; else minimal
-      sudo bash -c "$(declare -f try_copy_from_repo); try_copy_from_repo"
-      if [ ! -f "${WEB}/index.html" ]; then
-        sudo bash -c "$(declare -f gen_minimal_ui); gen_minimal_ui"
-      fi
-      sudo bash -c "$(declare -f gen_defaults); gen_defaults"
-      # minimal package.json
+
+      # Generate server + defaults
+      gen_server_js
+      try_copy_from_repo
+      # If no UI copied, generate minimal one
+      [ -f "${WEB}/index.html" ] || gen_minimal_ui
+      gen_defaults
+
+      # Minimal package.json
       if [ ! -f "$PKG" ]; then
         sudo tee "$PKG" >/dev/null <<'PKG'
 {
@@ -1194,21 +1557,25 @@ EOF
 }
 PKG
       fi
+
       (cd "$BASE" && sudo npm i --omit=dev)
+
       # systemd service pointing INSIDE BASE
       sudo tee "$SERVICE" >/dev/null <<UNIT
 [Unit]
 Description=Flux Web (portable)
 After=network-online.target
 Wants=network-online.target
+
 [Service]
 User=root
 WorkingDirectory=${BASE}
-Environment=FLUX_WEB_CONFIG=${ETC}/config.json
-Environment=FLUX_WEB_CATALOG=${ETC}/catalog.json
+Environment="FLUX_WEB_CONFIG=${ETC}/config.json"
+Environment="FLUX_WEB_CATALOG=${ETC}/catalog.json"
 ExecStart=/usr/bin/node ${SERVER}
 Restart=always
 RestartSec=2s
+
 [Install]
 WantedBy=multi-user.target
 UNIT
@@ -1222,7 +1589,6 @@ UNIT
       ensure_node || exit 1
       mkdir -p "$BASE" "$ETC" "$WEB"
       [ -f "$SERVER" ] || { gen_server_js; }
-      # prefer repo UI if present; else minimal
       try_copy_from_repo
       [ -f "${WEB}/index.html" ] || gen_minimal_ui
       gen_defaults
@@ -1257,23 +1623,25 @@ PKG
     stop)     sudo systemctl stop flux-web ;;
     restart)  sudo systemctl restart flux-web ;;
     open)
-      local port
+      local port bind
       if command -v jq >/dev/null 2>&1 && [ -f "${ETC}/config.json" ]; then
         port="$(jq -r '.port // 3088' "${ETC}/config.json" 2>/dev/null || echo 3088)"
+        bind="$(jq -r '.bind // "127.0.0.1"' "${ETC}/config.json" 2>/dev/null || echo 127.0.0.1)"
       elif [ -f "${ETC}/config.json" ]; then
-        port="$(grep -Eo '"port"\s*:\s*[0-9]+' "${ETC}/config.json" | awk -F: '{gsub(/[[:space:]]*/,"",$2); print $2}' | head -n1)"
-        port="${port:-3088}"
+        port="$(grep -Eo '"port"\s*:\s*[0-9]+' "${ETC}/config.json" | awk -F: '{gsub(/[[:space:]]*/,"",$2); print $2}' | head -n1)"; port="${port:-3088}"
+        bind="$(grep -Eo '"bind"\s*:\s*"[^"]+"' "${ETC}/config.json" | awk -F\" '{print $4}' | head -n1)"; bind="${bind:-127.0.0.1}"
       else
-        port=3088
+        port=3088; bind="127.0.0.1"
       fi
-      echo "Open http://127.0.0.1:${port}"
+      echo "Open http://${bind}:${port}"
       ;;
 
     *)
-      echo "Usage: $PROG web {install|uninstall|status|start|stop|restart|open|dev} [--path DIR] [--port N] [--token TOKEN] [--from REPO_DIR]"
+      echo "Usage: $PROG web {install|uninstall|status|start|stop|restart|open|dev} [--path DIR] [--port N] [--bind IP] [--token TOKEN] [--from REPO_DIR] [--catalog FILE] [--use-repo-ui]"
       exit 1;;
   esac
 }
+
 
 # ---------- Scaffolding ----------
 
@@ -1844,37 +2212,83 @@ usage() {
 Usage: $PROG <command> [args]
 
 Core:
-  init                           Create network & start nginx-proxy
-  fresh                          Reset proxy (down + recreate nginx-proxy)
-  setup-tunnel <TOKEN>           Start/replace permanent Cloudflare Tunnel (cloudflared)
-  reload-proxy                   Reload nginx-proxy configuration
-  status                         Show container status
+  init                             Create network & start nginx-proxy
+  fresh [--include-tunnel] [--recreate-network]
+                                   Reset proxy (down + recreate ${NETWORK_NAME}). Flags:
+                                     --include-tunnel     also stop/remove cloudflared
+                                     --recreate-network   drop & recreate ${NETWORK_NAME}
+  setup-tunnel <TOKEN> [--recreate] [--logs] [--project NAME]
+                                   Start or re-create permanent Cloudflare Tunnel
+
+  reload-proxy                     Reload nginx-proxy configuration
+  status                           Show container status
+  volumes                          List site-related Docker volumes (e.g., <site>_db-data)
 
 Sites:
-  add <config.json>              Add new site from JSON (compose + vhost rules)
-  update <config.json>           Update existing site from JSON
-  remove <name>                  Remove site's containers and vhost rules
-  list                           List site directories
+  add <config.json>                Add new site from JSON (compose + vhost rules)
+  update <config.json>             Update existing site from JSON (rebuild containers)
+  remove <name> [--keep-data]      Remove site's containers and vhost rules.
+                                   By default also removes named volumes (e.g., DB).
+                                   Use --keep-data to preserve volumes for reuse.
+  list                             List site directories
 
-Quick tunnels (no domain):
-  quick-start <name> [host]      Start trycloudflare tunnel for a site
-  quick-url <name>               Print trycloudflare URL
-  quick-stop <name>              Stop the quick tunnel
+Quick tunnels (ephemeral):
+  quick-start <name> [host]        Start trycloudflare tunnel for a site
+  quick-url <name>                 Print trycloudflare URL
+  quick-stop <name>                Stop the quick tunnel
 
 Scaffold:
-  scaffold <fullstack|static> <name> [--domain DOMAIN] [--api-domain API] [--db mysql|mariadb|postgres|none] [--php] [--up]
-                                 static: add --php for PHP, add --db for local DB
+  scaffold <fullstack|static> <name>
+           [--domain DOMAIN] [--api-domain API]
+           [--db mysql|mariadb|postgres|none] [--php] [--up]
+                                   Generate site.json from template (static: --php to enable PHP)
+
+Database:
+  db create   <site.json>          Ensure database/user exists (mysql|mariadb)
+  db dump     <site.json> <out.sql>
+  db restore  <site.json> <in.sql|.sql.gz>
+  db migrate  <host> <user> <pass> <db> <target.json> [--port N]
+  db migrate-remote ssh    <ssh_user@host> <src_db> <target.json>
+                            [--mysql-user u] [--mysql-pass p] [--mysql-sock /path]
+  db migrate-remote tunnel <ssh_user@host> <src_host> <target.json>
+                            [--src-user u] [--src-pass p] [--port N]
 
 Firewall:
   firewall <firewall.json> [--persist] [--dry-run]
-                                 Apply iptables rules from JSON (optionally persist)
+                                   Apply rules to ${BRIDGE_NAME}/${NETWORK_NAME}.
+  firewall clean <firewall.json> [--persist] [--dry-run]
+                                   Remove Flux rules/chains (optionally persist clean state).
+  firewall status [--raw] [--chains]
+                                   Show FORWARD and Flux chains; --raw for iptables -S, --chains to skip FORWARD.
+
+Web UI/API:
+    web install [--path DIR] [--port N] [--bind IP] [--token TOKEN] [--from REPO_DIR]
+        Install Web UI/API as a service. If --bind is omitted, binds to LAN IP when possible.
+    web dev [--path DIR] [--port N] [--bind IP] [--token TOKEN] [--from REPO_DIR]
+        Run Web UI in foreground. Auto-detects LAN IP if --bind not given.
+  web {start|stop|restart|status|open|uninstall} [--path DIR]
+                                   Manage the lightweight Node/Express web wrapper.
+
+Home & Config:
+  home show                        Show current BASE_DIR/REPO_DIR/config path
+  home set <dir>                   Set BASE_DIR (homeDir) in config
+  home prepare [--force] [--from DIR]
+                                   Populate templates into \$BASE_DIR/_templates
+  home repo-set <dir>              Set REPO_DIR in config
+  config show                      Print resolved config
+  config set <homeDir|repoDir> <value>
+
+Catalog (for web UI integration):
+  catalog-json                     Print JSON catalog describing exposed commands
 
 Notes:
   • Put site config at /Server/Applications/<name>/site.json (copied on add/update).
   • For path-based APIs, set paths.apiPrefixes and (optionally) stripApiPrefix.
-  • For production, add Public Hostnames in your Cloudflare Tunnel -> http://nginx-proxy:80.
+  • For production, add Public Hostnames in Cloudflare Tunnel -> http://nginx-proxy:80.
+  • 'remove' without --keep-data deletes named volumes (DB). Use --keep-data to preserve.
 USAGE
 }
+
 
 main() {
   ensure_jq
@@ -1883,11 +2297,13 @@ main() {
   case "$cmd" in
     --version|-v|version) echo "flux ${VERSION}"; exit 0 ;;
     init)              require docker; ensure_network; init_proxy; echo "Init complete." ;;
-    fresh)             ensure_network; fresh ;;
+    fresh)             ensure_network; fresh "$@" ;;
+    setup-tunnel)     [ $# -ge 1 ] || { echo "Usage: $PROG setup-tunnel <CLOUDFLARE_TUNNEL_TOKEN>"; exit 1; }; ensure_network; init_proxy; setup_tunnel "$@" ;;
     add)               [ $# -ge 1 ] || { usage; exit 1; }; cmd_add_update "$1" "add" ;;
     update)            [ $# -ge 1 ] || { usage; exit 1; }; cmd_add_update "$1" "update" ;;
     remove)            [ $# -ge 1 ] || { usage; exit 1; }; cmd_remove "$1" ;;
     list)              cmd_list ;;
+    volumes)           cmd_volumes ;;
     quick-start)       [ $# -ge 1 ] || { usage; exit 1; }; cmd_quick_start "$1" "${2:-}" ;;
     quick-stop)        [ $# -ge 1 ] || { usage; exit 1; }; cmd_quick_stop "$1" ;;
     quick-url)         [ $# -ge 1 ] || { usage; exit 1; }; cmd_quick_url "$1" ;;
