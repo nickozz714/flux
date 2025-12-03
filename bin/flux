@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-VERSION="0.6.9 - ALPHA"
+VERSION="0.7.1 - ALPHA"
 PROG="${0##*/}"
 
 BASE_DIR="/Server/Applications"
@@ -302,7 +302,8 @@ normalize_config() {
               enabled: ((.frontend.php.enabled // false)|tostring),
               version: (.frontend.php.version // "8.2")
             },
-            dotenv: (.frontend.dotenv // {})
+            dotenv: (.frontend.dotenv // {}),
+            volumes: (.frontend.volumes // [])
           }
         ),
         api: (
@@ -311,7 +312,8 @@ normalize_config() {
               build: (.api.build // "./api"),
               image: (.api.image // null),
               port: ((.api.port // 8080)|tostring),
-              configFile: (.api.configFile // null)
+              configFile: (.api.configFile // null),
+              volumes: (.api.volumes // [])
             }
           else
             null
@@ -422,25 +424,40 @@ YAML
 
 compose_add_api() {
   local norm="$1" out="$2"
-  local name a_build a_image a_port a_conf db_engine apiDomain svc
+  local name svc
+  local a_build a_image a_port a_conf apiDomain db_engine
+  local api_volumes_json
+
   name="$(json_get '.name' "$norm")"
   svc="$(safe_id "$name")"
+
+  # Only for fullstack sites
+  [ "$(json_get '.type' "$norm")" = "fullstack" ] || return 0
+
   a_build="$(json_get '.api.build' "$norm")"
+  [ -z "$a_build" ] && a_build="./api"
+
   a_image="$(json_get '.api.image' "$norm")"
+
   a_port="$(json_get '.api.port' "$norm")"
+  [ -z "$a_port" ] && a_port="8080"
+
   a_conf="$(json_get '.api.configFile' "$norm")"
   apiDomain="$(json_get '.apiDomain' "$norm")"
   db_engine="$(json_get '.db.engine' "$norm")"
 
-  [ "$(json_get '.type' "$norm")" = "fullstack" ] || return 0
+  # NEW: user-defined volumes from site.json → api.volumes
+  api_volumes_json="$(jq -c '.api.volumes // []' "$norm")"
 
   echo "  ${svc}-api:" >> "$out"
+
   if [ -n "$a_image" ] && [ "$a_image" != "null" ]; then
     echo "    image: ${a_image}" >> "$out"
   else
     echo "    build:" >> "$out"
     echo "      context: ${a_build}" >> "$out"
   fi
+
   cat >> "$out" <<YAML
     container_name: ${svc}-api
     networks: [${NETWORK_NAME}, ${svc}_internal]
@@ -455,18 +472,32 @@ YAML
 YAML
   fi
 
-  if [ -n "$a_conf" ] && [ "$a_conf" != "null" ]; then
-    cat >> "$out" <<YAML
-    volumes:
-      - ${a_conf}:/config/application.properties:ro
-YAML
+  # ---- volumes (configFile + api.volumes) ----
+  if { [ -n "$a_conf" ] && [ "$a_conf" != "null" ]; } || [ "$api_volumes_json" != "[]" ]; then
+    echo "    volumes:" >> "$out"
+
+    # configFile mount
+    if [ -n "$a_conf" ] && [ "$a_conf" != "null" ]; then
+      echo "      - ${a_conf}:/config/application.properties:ro" >> "$out"
+    fi
+
+    # user-defined api.volumes
+    if [ "$api_volumes_json" != "[]" ]; then
+      echo "$api_volumes_json" | jq -r '.[]' | while read -r vol; do
+        [ -z "$vol" ] && continue
+        echo "      - ${vol}" >> "$out"
+      done
+    fi
   fi
+
+  # Optional dedicated API VIRTUAL_HOST
   if [ -n "$apiDomain" ]; then
     cat >> "$out" <<YAML
     environment:
       - VIRTUAL_HOST=${apiDomain}
 YAML
   fi
+
   echo "    restart: unless-stopped" >> "$out"
   echo >> "$out"
 }
@@ -2205,6 +2236,529 @@ cmd_db_migrate_remote_tunnel() {
   rm -f "$tmp"
 }
 
+# ---------- TUI / Interactive Shell ----------
+
+# Theme / box characters (ASCII fallback if no UTF-8)
+tui_init_theme() {
+  local locale="${LC_ALL:-${LANG:-C}}"
+  if [[ "$locale" == *UTF-8* || "$locale" == *utf8* ]]; then
+    TUI_CHAR_H="─"
+    TUI_CHAR_V="│"
+    TUI_CHAR_TL="┌"
+    TUI_CHAR_TR="┐"
+    TUI_CHAR_BL="└"
+    TUI_CHAR_BR="┘"
+  else
+    TUI_CHAR_H="-"
+    TUI_CHAR_V="|"
+    TUI_CHAR_TL="+"
+    TUI_CHAR_TR="+"
+    TUI_CHAR_BL="+"
+    TUI_CHAR_BR="+"
+  fi
+
+  TUI_RESET=$'\e[0m'
+  TUI_DIM=$'\e[2m'
+  TUI_BOLD=$'\e[1m'
+  TUI_FG_TITLE=$'\e[38;5;81m'
+  TUI_FG_LOGO=$'\e[38;5;45m'
+  TUI_FG_MUTED=$'\e[38;5;245m'
+  TUI_FG_GOOD=$'\e[38;5;82m'
+  TUI_FG_BAD=$'\e[38;5;203m'
+  TUI_FG_WARN=$'\e[38;5;214m'
+  TUI_BG_HI=$'\e[48;5;24m'
+  TUI_FG_HI=$'\e[38;5;231m'
+}
+
+tui_term_size() {
+  TUI_COLS=$(tput cols 2>/dev/null || echo 80)
+  TUI_LINES=$(tput lines 2>/dev/null || echo 24)
+}
+
+tui_load_sites() {
+  mapfile -t TUI_SITES < <(cmd_list 2>/dev/null || true)
+}
+
+tui_draw_border() {
+  tui_term_size
+  local cols="$TUI_COLS" lines="$TUI_LINES"
+
+  # top
+  tput cup 0 0
+  printf "%s" "$TUI_CHAR_TL"
+  printf '%*s' $((cols-2)) '' | tr ' ' "$TUI_CHAR_H"
+  printf "%s" "$TUI_CHAR_TR"
+
+  # sides
+  local r
+  for ((r=1; r<lines-1; r++)); do
+    tput cup "$r" 0;           printf "%s" "$TUI_CHAR_V"
+    tput cup "$r" $((cols-1)); printf "%s" "$TUI_CHAR_V"
+  done
+
+  # bottom
+  tput cup $((lines-1)) 0
+  printf "%s" "$TUI_CHAR_BL"
+  printf '%*s' $((cols-2)) '' | tr ' ' "$TUI_CHAR_H"
+  printf "%s" "$TUI_CHAR_BR"
+}
+
+tui_draw_logo() {
+  local logo1="  ______ _                 "
+  local logo2=" |  ____| |                "
+  local logo3=" | |__  | | ___  _   _  __ "
+  local logo4=" |  __| | |/ _ \| | | |/ / "
+  local logo5=" | |    | | (_) | |_|   <  "
+  local logo6=" |_|    |_|\___/ \__,_|\_\ "
+
+  tput cup 1 2
+  printf "%b%s%b" "$TUI_FG_LOGO" "$logo1" "$TUI_RESET"
+  tput cup 2 2; printf "%b%s%b" "$TUI_FG_LOGO" "$logo2" "$TUI_RESET"
+  tput cup 3 2; printf "%b%s%b" "$TUI_FG_LOGO" "$logo3" "$TUI_RESET"
+  tput cup 4 2; printf "%b%s%b" "$TUI_FG_LOGO" "$logo4" "$TUI_RESET"
+  tput cup 5 2; printf "%b%s%b" "$TUI_FG_LOGO" "$logo5" "$TUI_RESET"
+  tput cup 6 2; printf "%b%s%b" "$TUI_FG_LOGO" "$logo6" "$TUI_RESET"
+
+  # title + version
+  local title="flux ${VERSION}   TUI console"
+  tput cup 1 40
+  printf "%b%s%b" "$TUI_FG_TITLE$TUI_BOLD" "$title" "$TUI_RESET"
+  tput cup 2 40
+  printf "%b%s%b" "$TUI_DIM" "↑/↓ or j/k move · Enter actions · q quit" "$TUI_RESET"
+}
+
+tui_draw_footer() {
+  local msg="${1:-Press Enter for actions · q to quit}"
+  tui_term_size
+  local cols="$TUI_COLS" lines="$TUI_LINES"
+
+  # horizontal line above status
+  tput cup $((lines-2)) 1
+  printf '%*s' $((cols-2)) '' | tr ' ' "$TUI_CHAR_H"
+
+  # status bar
+  tput cup $((lines-1)) 2
+  printf "%b%s%b" "$TUI_FG_MUTED" "$msg" "$TUI_RESET"
+  tput el
+}
+
+tui_draw_sites() {
+  local selected="$1"
+  tui_term_size
+  local cols="$TUI_COLS" lines="$TUI_LINES"
+
+  local list_top=8
+  local list_bottom=$((lines-3))
+  local list_height=$((list_bottom - list_top - 1))
+  (( list_height < 3 )) && list_height=3
+
+  # left panel title
+  tput cup $((list_top-1)) 2
+  printf "%bSites in %s%b" "$TUI_BOLD" "$BASE_DIR" "$TUI_RESET"
+  tput cup "$list_top" 2
+  printf '%*s' $((cols/2 - 3)) '' | tr ' ' "$TUI_CHAR_H"
+
+  local total=${#TUI_SITES[@]}
+  [ "$total" -lt 0 ] && total=0
+
+  # scrolling
+  if [ -z "${TUI_SCROLL:-}" ]; then
+    TUI_SCROLL=0
+  fi
+  if (( selected < TUI_SCROLL )); then
+    TUI_SCROLL=$selected
+  fi
+  if (( selected >= TUI_SCROLL + list_height )); then
+    TUI_SCROLL=$((selected - list_height + 1))
+  fi
+  (( TUI_SCROLL < 0 )) && TUI_SCROLL=0
+
+  local row="$list_top"
+  local i start end
+  start=$TUI_SCROLL
+  end=$((TUI_SCROLL + list_height - 1))
+  (( end >= total )) && end=$((total-1))
+
+  # up indicator
+  tput cup "$list_top" $((cols/2 - 2))
+  if (( TUI_SCROLL > 0 )); then
+    printf "%b▲%b" "$TUI_FG_MUTED" "$TUI_RESET"
+  else
+    printf " "
+  fi
+
+  for ((i=start; i<=end; i++)); do
+    tput cup "$row" 2
+    tput el
+    local name="${TUI_SITES[$i]}"
+    [ -z "$name" ] && name="(unnamed)"
+
+    if [ "$i" -eq "$selected" ]; then
+      # animated-ish highlight (flip background color based on index)
+      local bg="$TUI_BG_HI" fg="$TUI_FG_HI"
+      printf "%b%s %-*s %b" "$bg$fg" "►" $((cols/2 - 8)) "$name" "$TUI_RESET"
+    else
+      printf "  %-*s" $((cols/2 - 8)) "$name"
+    fi
+    row=$((row+1))
+  done
+
+  # clear remaining lines
+  while (( row <= list_bottom )); do
+    tput cup "$row" 2
+    tput el
+    row=$((row+1))
+  done
+
+  # down indicator
+  tput cup "$list_bottom" $((cols/2 - 2))
+  if (( end < total-1 )); then
+    printf "%b▼%b" "$TUI_FG_MUTED" "$TUI_RESET"
+  else
+    printf " "
+  fi
+}
+
+tui_site_status_panel() {
+  local site="$1"
+  tui_term_size
+  local cols="$TUI_COLS" lines="$TUI_LINES"
+  local col_start=$((cols/2 + 1))
+  local row=8
+
+  # panel title
+  tput cup $((row-1)) "$col_start"
+  printf "%bSite details%b" "$TUI_BOLD" "$TUI_RESET"
+  tput cup "$row" "$col_start"
+  printf '%*s' $((cols - col_start - 2)) '' | tr ' ' "$TUI_CHAR_H"
+  row=$((row+1))
+
+  if [ -z "$site" ]; then
+    tput cup "$row" "$col_start"
+    printf "%bNo site selected%b" "$TUI_DIM" "$TUI_RESET"
+    return
+  fi
+
+  local dir="${BASE_DIR}/${site}"
+  tput cup "$row" "$col_start"; tput el
+  printf "%bName:%b %s" "$TUI_BOLD" "$TUI_RESET" "$site"
+  row=$((row+1))
+
+  tput cup "$row" "$col_start"; tput el
+  printf "%bPath:%b %s" "$TUI_BOLD" "$TUI_RESET" "$dir"
+  row=$((row+1))
+
+  # docker status
+  local patt ps_out
+  patt="$(safe_id "$site")"
+  ps_out="$(sudo docker ps --format '{{.Names}}\t{{.Status}}' 2>/dev/null | grep "^${patt}-" || true)"
+
+  tput cup "$row" "$col_start"; tput el
+  printf "%bContainers:%b" "$TUI_BOLD" "$TUI_RESET"
+  row=$((row+1))
+
+  if [ -z "$ps_out" ]; then
+    tput cup "$row" "$col_start"; tput el
+    printf "  %b(none running)%b" "$TUI_DIM" "$TUI_RESET"
+    row=$((row+1))
+  else
+    local cname cstat
+    while IFS=$'\t' read -r cname cstat; do
+      tput cup "$row" "$col_start"; tput el
+      printf "  %-20s %s" "$cname" "$cstat"
+      row=$((row+1))
+    done <<< "$ps_out"
+  fi
+}
+
+tui_spinner_run() {
+  # usage: tui_spinner_run "message" command args...
+  local msg="$1"; shift || true
+  local cols; cols=$(tput cols 2>/dev/null || echo 80)
+  local sp='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+  local i=0 ch
+  (
+    "$@"
+  ) &
+  local pid=$!
+
+  while kill -0 "$pid" 2>/dev/null; do
+    ch="${sp:i++%${#sp}:1}"
+    tput cup $((TUI_LINES-1)) 2
+    printf "%b[%s]%b %s" "$TUI_FG_MUTED" "$ch" "$TUI_RESET" "$msg"
+    sleep 0.1
+  done
+  wait "$pid"
+}
+
+tui_popup_box() {
+  # Draw a centered box with title; body is drawn by caller.
+  local title="$1"
+  tui_term_size
+  local cols="$TUI_COLS" lines="$TUI_LINES"
+  local width=$((cols/2))
+  (( width < 40 )) && width=40
+  local height=8
+  local top=$(( (lines - height) / 2 ))
+  local left=$(( (cols - width) / 2 ))
+
+  # frame
+  tput cup "$top" "$left"
+  printf "%s" "$TUI_CHAR_TL"
+  printf '%*s' $((width-2)) '' | tr ' ' "$TUI_CHAR_H"
+  printf "%s" "$TUI_CHAR_TR"
+
+  local r
+  for ((r=top+1; r<top+height-1; r++)); do
+    tput cup "$r" "$left"; printf "%s" "$TUI_CHAR_V"
+    tput cup "$r" $((left+width-1)); printf "%s" "$TUI_CHAR_V"
+  done
+
+  tput cup $((top+height-1)) "$left"
+  printf "%s" "$TUI_CHAR_BL"
+  printf '%*s' $((width-2)) '' | tr ' ' "$TUI_CHAR_H"
+  printf "%s" "$TUI_CHAR_BR"
+
+  # title
+  tput cup "$top" $((left+2))
+  printf "%b%s%b" "$TUI_BOLD" "$title" "$TUI_RESET"
+
+  TUI_POP_TOP="$top"
+  TUI_POP_LEFT="$left"
+  TUI_POP_WIDTH="$width"
+  TUI_POP_HEIGHT="$height"
+}
+
+tui_popup_menu() {
+  # usage: idx=$(tui_popup_menu "Title" "Opt1" "Opt2" ...)
+  local title="$1"; shift || true
+  local options=("$@")
+  local selected=0 key rest
+  tui_popup_box "$title"
+
+  while true; do
+    local i row
+    row=$((TUI_POP_TOP+2))
+    for i in "${!options[@]}"; do
+      local text="${options[$i]}"
+      tput cup "$row" $((TUI_POP_LEFT+3)); tput el
+      if [ "$i" -eq "$selected" ]; then
+        printf "%b %s %b" "$TUI_BG_HI$TUI_FG_HI" "$text" "$TUI_RESET"
+      else
+        printf " %s " "$text"
+      fi
+      row=$((row+1))
+    done
+
+    tput cup $((TUI_POP_TOP+TUI_POP_HEIGHT-2)) $((TUI_POP_LEFT+3))
+    printf "%b↑/↓ select · Enter confirm · Esc cancel%b" "$TUI_DIM" "$TUI_RESET"
+
+    if ! read -rsn1 key < /dev/tty; then
+      echo "-1"; return
+    fi
+
+    if [[ "$key" == $'\x1b' ]]; then
+      read -rsn2 rest 2>/dev/null || true
+      key+="$rest"
+      case "$key" in
+        $'\x1b[A') key='k' ;;  # up
+        $'\x1b[B') key='j' ;;  # down
+        $'\x1b')   echo "-1"; return ;;
+      esac
+    fi
+
+    case "$key" in
+      q|$'\x1b') echo "-1"; return ;;
+      j)
+        selected=$((selected+1))
+        (( selected >= ${#options[@]} )) && selected=0
+        ;;
+      k)
+        selected=$((selected-1))
+        (( selected < 0 )) && selected=$(( ${#options[@]} - 1 ))
+        ;;
+      '') # Enter
+        echo "$selected"
+        return
+        ;;
+    esac
+  done
+}
+
+tui_confirm_keep_data() {
+  # Returns "yes" or "no"; toggles keep_data flag inside dialog
+  local site="$1" keep="${2:-no}" key
+  tui_popup_box "Remove site: ${site}"
+
+  while true; do
+    tput cup $((TUI_POP_TOP+2)) $((TUI_POP_LEFT+3)); tput el
+    printf "Remove site %b%s%b" "$TUI_BOLD" "$site" "$TUI_RESET"
+
+    tput cup $((TUI_POP_TOP+4)) $((TUI_POP_LEFT+3)); tput el
+    printf "Keep data (volumes): [%s]" "$keep"
+
+    tput cup $((TUI_POP_TOP+5)) $((TUI_POP_LEFT+3)); tput el
+    printf "%bSpace%b toggle · %bEnter%b confirm · %bEsc%b cancel" \
+      "$TUI_BOLD" "$TUI_RESET" "$TUI_BOLD" "$TUI_RESET" "$TUI_BOLD" "$TUI_RESET"
+
+    if ! read -rsn1 key < /dev/tty; then
+      echo "no"; return
+    fi
+
+    if [[ "$key" == $'\x1b' ]]; then
+      echo "no"; return
+    fi
+
+    case "$key" in
+      ' ')
+        if [ "$keep" = "no" ]; then keep="yes"; else keep="no"; fi
+        ;;
+      '') # Enter
+        echo "$keep"; return ;;
+      q)  echo "no"; return ;;
+    esac
+  done
+}
+
+tui_actions_menu() {
+  local site="$1"
+  [ -z "$site" ] && return
+  local options=("Start" "Stop" "Rebuild (no-cache)" "Remove…" "Back")
+  local choice keep ans msg
+
+  local idx
+  idx=$(tui_popup_menu "Actions for ${site}" "${options[@]}")
+  [ "$idx" -lt 0 ] && return
+
+  case "$idx" in
+    0)
+      tui_spinner_run "Starting ${site}..." site_up "$site"
+      msg="Started ${site}."
+      ;;
+    1)
+      tui_spinner_run "Stopping ${site}..." site_down "$site"
+      msg="Stopped ${site}."
+      ;;
+    2)
+      tui_spinner_run "Rebuilding ${site}..." site_up_force "$site"
+      msg="Rebuilt & redeployed ${site}."
+      ;;
+    3)
+      keep=$(tui_confirm_keep_data "$site" "no")
+      if [ "$keep" = "cancel" ]; then
+        msg="Remove cancelled."
+      else
+        if [ "$keep" = "yes" ]; then
+          tui_spinner_run "Removing ${site} (keep data)..." cmd_remove "$site" --keep-data
+          msg="Removed ${site}, kept volumes."
+        else
+          tui_spinner_run "Removing ${site}..." cmd_remove "$site"
+          msg="Removed ${site} and volumes."
+        fi
+        tui_load_sites
+      fi
+      ;;
+    *)
+      msg="Cancelled."
+      ;;
+  esac
+
+  TUI_LAST_MSG="$msg"
+}
+
+tui_main() {
+  local key rest selected=0
+  TUI_LAST_MSG="Press Enter for actions · q to quit"
+  TUI_SCROLL=0
+  TUI_SITES=()
+
+  tui_init_theme
+  tui_load_sites
+
+  if [ "${#TUI_SITES[@]}" -eq 0 ]; then
+    echo "No sites found in ${BASE_DIR} (other than _proxy)."
+    echo "Use: $PROG scaffold ...  or  $PROG add <site.json>"
+    return 0
+  fi
+
+  # Save old tty state
+  local OLD_STTY
+  OLD_STTY="$(stty -g 2>/dev/null || echo '')"
+  stty -echo -icanon time 0 min 1 2>/dev/null || true
+  tput civis 2>/dev/null || true
+  trap 'stty "$OLD_STTY" 2>/dev/null || true; tput cnorm 2>/dev/null || true; tput clear 2>/dev/null || true; exit' INT TERM EXIT
+
+  while true; do
+    tput clear
+    tui_draw_border
+    tui_draw_logo
+    tui_draw_sites "$selected"
+    tui_site_status_panel "${TUI_SITES[$selected]}"
+    tui_draw_footer "$TUI_LAST_MSG"
+    TUI_LAST_MSG=""
+
+    if ! read -rsn1 key < /dev/tty; then
+      TUI_LAST_MSG="Input error (no TTY?)"
+      continue
+    fi
+
+    # arrow keys: ESC [ A/B
+    if [[ "$key" == $'\x1b' ]]; then
+      read -rsn2 rest < /dev/tty 2>/dev/null || true
+      key+="$rest"
+      case "$key" in
+        $'\x1b[A') key='k' ;;  # up
+        $'\x1b[B') key='j' ;;  # down
+      esac
+    fi
+
+    case "$key" in
+      q)
+        break
+        ;;
+      j)
+        if [ "${#TUI_SITES[@]}" -gt 0 ]; then
+          selected=$((selected+1))
+          if [ "$selected" -ge "${#TUI_SITES[@]}" ]; then
+            selected=$(( ${#TUI_SITES[@]} - 1 ))
+          fi
+        fi
+        ;;
+      k)
+        if [ "$selected" -gt 0 ]; then
+          selected=$((selected-1))
+        fi
+        ;;
+      '') # Enter
+        tui_actions_menu "${TUI_SITES[$selected]}"
+        ;;
+      r)
+        tui_load_sites
+        if [ "$selected" -ge "${#TUI_SITES[@]}" ]; then
+          selected=$(( ${#TUI_SITES[@]} - 1 ))
+        fi
+        TUI_LAST_MSG="Refreshed site list."
+        ;;
+    esac
+  done
+
+  stty "$OLD_STTY" 2>/dev/null || true
+  tput cnorm 2>/dev/null || true
+  tput clear 2>/dev/null || true
+  trap - INT TERM EXIT
+}
+
+cmd_tui() {
+  require docker
+  ensure_base_dir
+  if [ ! -t 0 ]; then
+    echo "flux menu must be run in an interactive terminal (no pipes/redirects)." >&2
+    return 1
+  fi
+  tui_main
+}
+
+
 # ---------- CLI ----------
 
 usage() {
@@ -2222,6 +2776,7 @@ Core:
 
   reload-proxy                     Reload nginx-proxy configuration
   status                           Show container status
+  menu                             Full-screen terminal UI for listing & managing sites
   volumes                          List site-related Docker volumes (e.g., <site>_db-data)
 
 Sites:
@@ -2301,7 +2856,7 @@ main() {
     setup-tunnel)     [ $# -ge 1 ] || { echo "Usage: $PROG setup-tunnel <CLOUDFLARE_TUNNEL_TOKEN>"; exit 1; }; ensure_network; init_proxy; setup_tunnel "$@" ;;
     add)               [ $# -ge 1 ] || { usage; exit 1; }; cmd_add_update "$1" "add" ;;
     update)            [ $# -ge 1 ] || { usage; exit 1; }; cmd_add_update "$1" "update" ;;
-    remove)            [ $# -ge 1 ] || { usage; exit 1; }; cmd_remove "$1" ;;
+    remove)            [ $# -ge 1 ] || { usage; exit 1; }; cmd_remove "$@" ;;
     list)              cmd_list ;;
     volumes)           cmd_volumes ;;
     quick-start)       [ $# -ge 1 ] || { usage; exit 1; }; cmd_quick_start "$1" "${2:-}" ;;
@@ -2329,6 +2884,7 @@ main() {
       esac
       ;;
     status)            cmd_status ;;
+    menu)               cmd_tui ;;
     home)              cmd_home "$@" ;;
     config)            sub="${1:-}"; shift || true; case "$sub" in show) cmd_config_show ;; set) cmd_config_set "$@" ;; *) echo "Usage: $PROG config {show|set <key> <val>}"; exit 1;; esac ;;
     firewall)
