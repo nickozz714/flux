@@ -1,0 +1,900 @@
+diff --git a/bin/flux b/bin/flux
+index 0000000..0000000 100755
+--- a/bin/flux
++++ b/bin/flux
+@@ -1,12 +1,12 @@
+
+ #!/usr/bin/env bash
+ # flux — Manage multi-site Docker deployments behind nginx-proxy + Cloudflare tunnels.
+ # Requires: bash, docker, docker compose plugin, jq, iptables/ip6tables
+
+ set -euo pipefail
+
+-VERSION="0.7.3 - ALPHA"
++VERSION="0.8.0 - ALPHA"
+ PROG="${0##*/}"
+
+ BASE_DIR="/Server/Applications"
+@@ -61,6 +61,13 @@ safe_id() {
+   printf '%s' "$s"
+ }
+
++# Service id for sub-resources (api/db ids)
++svc_id() {
++  local site; site="$(safe_id "$1")"
++  local sub;  sub="$(safe_id "$2")"
++  printf '%s-%s' "$site" "$sub"
++}
++
+ ensure_jq() {
+   if command -v jq >/dev/null 2>&1; then return; fi
+   echo "jq not found; attempting to install..."
+@@ -170,55 +177,130 @@ normalize_config() {
+   # Input: $1 = source cfg (site.json)
+   # Output: prints normalized JSON to stdout
+   local cfg="$1"
+   jq -c '
+     . as $in
+     | {
+         name: (.name),
+         type: (.type // "static"),
+         localHost: (.localHost // (.name + ".local")),
+         domain: (.domain // ""),
+         apiDomain: (.apiDomain // ""),
+         frontend: (
+           {
+             build: (.frontend.build // "./"),
+             image: (.frontend.image // null),
+             port: ((.frontend.port // 80) | tostring),
+             server: (.frontend.server // "nginx"),
+             spa: ((.frontend.spa // false)|tostring),
+             index: (.frontend.index // "index.html"),
+             generateDockerFile: ((.frontend.generateDockerFile // false)|tostring),
+             php: {
+               enabled: ((.frontend.php.enabled // false)|tostring),
+               version: (.frontend.php.version // "8.2")
+             },
+             dotenv: (.frontend.dotenv // {}),
+             volumes: (.frontend.volumes // [])
+           }
+         ),
+-        api: (
+-          if (.type // "static") == "fullstack" then
+-            {
+-              build: (.api.build // "./api"),
+-              image: (.api.image // null),
+-              port: ((.api.port // 8080)|tostring),
+-              configFile: (.api.configFile // null),
+-              volumes: (.api.volumes // [])
+-            }
+-          else
+-            null
+-          end
+-        ),
+-        db: (
+-          if (.db // null) == null then
+-            { engine: "mysql", name: null, user: null, password: null, rootPassword: null, initSql: null, version: null }
+-          else
+-            {
+-              engine: (if (.db.engine // null) == null then "mysql" else .db.engine end),
+-              name: (.db.name // .db.database // null),
+-              user: (.db.user // null),
+-              password: (.db.password // null),
+-              rootPassword: (.db.rootPassword // null),
+-              initSql: (.db.initSql // null),
+-              version: (.db.version // null)
+-            }
+-          end
+-        ),
++        # ---- MULTI APIs (back-compat with .api) ----
++        apis: (
++          if (.apis|type) == "array" then
++            (.apis | map({
++              id: (.id // "api"),
++              build: (.build // "./api"),
++              image: (.image // null),
++              port: ((.port // 8080) | tostring),
++              configFile: (.configFile // null),
++              volumes: (.volumes // []),
++              dbRef: (.dbRef // "")
++            }))
++          elif (.api // null) != null then
++            [ {
++              id: "api",
++              build: (.api.build // "./api"),
++              image: (.api.image // null),
++              port: ((.api.port // 8080) | tostring),
++              configFile: (.api.configFile // null),
++              volumes: (.api.volumes // []),
++              dbRef: (.api.dbRef // "")
++            } ]
++          elif (.type // "static") == "fullstack" then
++            [ { id:"api", build:"./api", image:null, port:"8080", configFile:null, volumes:[], dbRef:"" } ]
++          else
++            []
++          end
++        ),
++
++        # ---- MULTI DBs (back-compat with .db) ----
++        dbs: (
++          if (.dbs|type) == "array" then
++            (.dbs | map({
++              id: (.id // "db"),
++              engine: (if (.engine // null) == null then "mysql" else .engine end),
++              name: (.name // .database // null),
++              user: (.user // null),
++              password: (.password // null),
++              rootPassword: (.rootPassword // null),
++              initSql: (.initSql // null),
++              version: (.version // null)
++            }))
++          elif (.db // null) != null then
++            [ {
++              id: "db",
++              engine: (if (.db.engine // null) == null then "mysql" else .db.engine end),
++              name: (.db.name // .db.database // null),
++              user: (.db.user // null),
++              password: (.db.password // null),
++              rootPassword: (.db.rootPassword // null),
++              initSql: (.db.initSql // null),
++              version: (.db.version // null)
++            } ]
++          else
++            []
++          end
++        ),
++
++        # ---- ROUTES (back-compat with .paths.apiPrefixes) ----
++        routes: (
++          if (.routes|type) == "array" then
++            (.routes | map({
++              prefix: (.prefix // "/api/"),
++              apiRef: (.apiRef // "api"),
++              stripPrefix: ((.stripPrefix // false)|tostring)
++            }))
++          else
++            (
++              (.paths.apiPrefixes // ["/api/"])
++              | map({
++                  prefix: .,
++                  apiRef: "api",
++                  stripPrefix: ((.paths.stripApiPrefix // false)|tostring)
++                })
++            )
++          end
++        ),
+         paths: {
+           apiPrefixes: (.paths.apiPrefixes // ["/api/"]),
+           stripApiPrefix: ((.paths.stripApiPrefix // false)|tostring)
+         },
+         useExternalDbOf: (.useExternalDbOf // "")
+       }
+   ' "$cfg"
+ }
+
+@@ -238,86 +320,226 @@ compose_init() {
+   } > "$out"
+ }
+
+-compose_add_db() {
+-  local norm="$1" out="$2"
+-  local name db_engine db_name db_user db_pass db_root db_init db_ver svc
+-  name="$(json_get '.name' "$norm")"
+-  svc="$(safe_id "$name")"
+-  db_engine="$(json_get '.db.engine' "$norm")"
+-  db_name="$(json_get '.db.name' "$norm")"
+-  db_user="$(json_get '.db.user' "$norm")"
+-  db_pass="$(json_get '.db.password' "$norm")"
+-  db_root="$(json_get '.db.rootPassword' "$norm")"
+-  db_init="$(json_get '.db.initSql' "$norm")"
+-  db_ver="$(json_get '.db.version' "$norm")"
+-
+-  [ -n "$db_engine" ] && [ "$db_engine" != "null" ] || return 0
+-
+-  case "$db_engine" in
+-    mysql|mariadb)
+-      local img="mysql:8"; [ "$db_engine" = "mariadb" ] && img="mariadb:${db_ver:-11}"
+-      cat >> "$out" <<YAML
+-  ${svc}-db:
+-    image: ${img}
+-    container_name: ${svc}-db
+-    networks: [${svc}_internal]
+-    environment:
+-      - MYSQL_ROOT_PASSWORD=${db_root}
+-      - MYSQL_DATABASE=${db_name}
+-$( [ -n "$db_user" ] && echo "      - MYSQL_USER=${db_user}" )
+-$( [ -n "$db_pass" ] && echo "      - MYSQL_PASSWORD=${db_pass}" )
+-    volumes:
+-      - db-data:/var/lib/mysql
+-$( [ -n "$db_init" ] && echo "      - ./${db_init}:/docker-entrypoint-initdb.d/01_init.sql:ro" )
+-    healthcheck:
+-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--password=${db_root}", "--user=root"]
+-      interval: 10s
+-      timeout: 5s
+-      retries: 10
+-    restart: unless-stopped
+-
+-YAML
+-      ;;
+-    postgres)
+-      cat >> "$out" <<YAML
+-  ${svc}-db:
+-    image: postgres:${db_ver:-16}
+-    container_name: ${svc}-db
+-    networks: [${svc}_internal]
+-    environment:
+-      - POSTGRES_PASSWORD=${db_root}
+-      - POSTGRES_DB=${db_name}
+-$( [ -n "$db_user" ] && echo "      - POSTGRES_USER=${db_user}" )
+-    volumes:
+-      - db-data:/var/lib/postgresql/data
+-$( [ -n "$db_init" ] && echo "      - ./${db_init}:/docker-entrypoint-initdb.d/01_init.sql:ro" )
+-    healthcheck:
+-      test: ["CMD-SHELL", "pg_isready -U ${db_user:-postgres} -d ${db_name}"]
+-      interval: 10s
+-      timeout: 5s
+-      retries: 10
+-    restart: unless-stopped
+-
+-YAML
+-      ;;
+-    *)
+-      echo "WARN: Unsupported db.engine '${db_engine}' — skipping DB service." ;;
+-  esac
+-}
++compose_add_dbs() {
++  local norm="$1" out="$2"
++  local site_name site site_net
++  site_name="$(json_get '.name' "$norm")"
++  site="$(safe_id "$site_name")"
++  site_net="${site}_internal"
++
++  local len; len="$(jq '.dbs | length' "$norm")"
++  [ "$len" -gt 0 ] || return 0
++
++  for i in $(seq 0 $((len-1))); do
++    local id engine db_name db_user db_pass db_root db_init db_ver
++    id="$(jq -r ".dbs[$i].id // \"db\"" "$norm")"
++    engine="$(jq -r ".dbs[$i].engine // \"mysql\"" "$norm")"
++    db_name="$(jq -r ".dbs[$i].name // empty" "$norm")"
++    db_user="$(jq -r ".dbs[$i].user // empty" "$norm")"
++    db_pass="$(jq -r ".dbs[$i].password // empty" "$norm")"
++    db_root="$(jq -r ".dbs[$i].rootPassword // empty" "$norm")"
++    db_init="$(jq -r ".dbs[$i].initSql // empty" "$norm")"
++    db_ver="$(jq -r ".dbs[$i].version // empty" "$norm")"
++
++    [ -n "$engine" ] && [ "$engine" != "null" ] || continue
++    local dbid; dbid="$(safe_id "$id")"
++    local svc="${site}-db-${dbid}"
++    local vol="db-${dbid}-data"
++
++    case "$engine" in
++      mysql|mariadb)
++        local img="mysql:8"
++        [ "$engine" = "mariadb" ] && img="mariadb:${db_ver:-11}"
++        cat >> "$out" <<YAML
++  ${svc}:
++    image: ${img}
++    container_name: ${svc}
++    networks: [${site_net}]
++    environment:
++      - MYSQL_ROOT_PASSWORD=${db_root}
++      - MYSQL_DATABASE=${db_name}
++$( [ -n "$db_user" ] && echo "      - MYSQL_USER=${db_user}" )
++$( [ -n "$db_pass" ] && echo "      - MYSQL_PASSWORD=${db_pass}" )
++    volumes:
++      - ${vol}:/var/lib/mysql
++$( [ -n "$db_init" ] && echo "      - ./${db_init}:/docker-entrypoint-initdb.d/01_init.sql:ro" )
++    healthcheck:
++      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--password=${db_root}", "--user=root"]
++      interval: 10s
++      timeout: 5s
++      retries: 10
++    restart: unless-stopped
++
++YAML
++        ;;
++      postgres)
++        cat >> "$out" <<YAML
++  ${svc}:
++    image: postgres:${db_ver:-16}
++    container_name: ${svc}
++    networks: [${site_net}]
++    environment:
++      - POSTGRES_PASSWORD=${db_root}
++      - POSTGRES_DB=${db_name}
++$( [ -n "$db_user" ] && echo "      - POSTGRES_USER=${db_user}" )
++    volumes:
++      - ${vol}:/var/lib/postgresql/data
++$( [ -n "$db_init" ] && echo "      - ./${db_init}:/docker-entrypoint-initdb.d/01_init.sql:ro" )
++    healthcheck:
++      test: ["CMD-SHELL", "pg_isready -U ${db_user:-postgres} -d ${db_name}"]
++      interval: 10s
++      timeout: 5s
++      retries: 10
++    restart: unless-stopped
++
++YAML
++        ;;
++      *)
++        echo "WARN: Unsupported db.engine '${engine}' — skipping DB service id=${id}." ;;
++    esac
++  done
++}
+
+-compose_add_api() {
++compose_add_apis() {
+   local norm="$1" out="$2"
+-  local name svc
+-  local a_build a_image a_port a_conf apiDomain db_engine
+-  local api_volumes_json
+-
+-  name="$(json_get '.name' "$norm")"
+-  svc="$(safe_id "$name")"
+-
+-  # Only for fullstack sites
+-  [ "$(json_get '.type' "$norm")" = "fullstack" ] || return 0
+-
+-  a_build="$(json_get '.api.build' "$norm")"
+-  [ -z "$a_build" ] && a_build="./api"
+-
+-  a_image="$(json_get '.api.image' "$norm")"
+-
+-  a_port="$(json_get '.api.port' "$norm")"
+-  [ -z "$a_port" ] && a_port="8080"
+-
+-  a_conf="$(json_get '.api.configFile' "$norm")"
+-  apiDomain="$(json_get '.apiDomain' "$norm")"
+-  db_engine="$(json_get '.db.engine' "$norm")"
+-
+-  # NEW: user-defined volumes from site.json → api.volumes
+-  api_volumes_json="$(jq -c '.api.volumes // []' "$norm")"
+-
+-  echo "  ${svc}-api:" >> "$out"
+-
+-  if [ -n "$a_image" ] && [ "$a_image" != "null" ]; then
+-    echo "    image: ${a_image}" >> "$out"
+-  else
+-    echo "    build:" >> "$out"
+-    echo "      context: ${a_build}" >> "$out"
+-  fi
+-
+-  cat >> "$out" <<YAML
+-    container_name: ${svc}-api
+-    networks: [${NETWORK_NAME}, ${svc}_internal]
+-    expose: ["${a_port}"]
+-YAML
+-
+-  if [ -n "$db_engine" ] && [ "$db_engine" != "null" ]; then
+-    cat >> "$out" <<YAML
+-    depends_on:
+-      ${svc}-db:
+-        condition: service_healthy
+-YAML
+-  fi
+-
+-  # ---- volumes (configFile + api.volumes) ----
+-  if { [ -n "$a_conf" ] && [ "$a_conf" != "null" ]; } || [ "$api_volumes_json" != "[]" ]; then
+-    echo "    volumes:" >> "$out"
+-
+-    # configFile mount
+-    if [ -n "$a_conf" ] && [ "$a_conf" != "null" ]; then
+-      echo "      - ${a_conf}:/config/application.properties:ro" >> "$out"
+-    fi
+-
+-    # user-defined api.volumes
+-    if [ "$api_volumes_json" != "[]" ]; then
+-      echo "$api_volumes_json" | jq -r '.[]' | while read -r vol; do
+-        [ -z "$vol" ] && continue
+-        echo "      - ${vol}" >> "$out"
+-      done
+-    fi
+-  fi
+-
+-  # Optional dedicated API VIRTUAL_HOST
+-  if [ -n "$apiDomain" ]; then
+-    cat >> "$out" <<YAML
+-    environment:
+-      - VIRTUAL_HOST=${apiDomain}
+-YAML
+-  fi
+-
+-  echo "    restart: unless-stopped" >> "$out"
+-  echo >> "$out"
++  local site_name site site_net
++  site_name="$(json_get '.name' "$norm")"
++  site="$(safe_id "$site_name")"
++  site_net="${site}_internal"
++
++  [ "$(json_get '.type' "$norm")" = "fullstack" ] || return 0
++  local len; len="$(jq '.apis | length' "$norm")"
++  [ "$len" -gt 0 ] || return 0
++
++  local apiDomain; apiDomain="$(json_get '.apiDomain' "$norm")"
++
++  for i in $(seq 0 $((len-1))); do
++    local id a_build a_image a_port a_conf dbRef
++    id="$(jq -r ".apis[$i].id // \"api\"" "$norm")"
++    a_build="$(jq -r ".apis[$i].build // \"./api\"" "$norm")"
++    a_image="$(jq -r ".apis[$i].image // empty" "$norm")"
++    a_port="$(jq -r ".apis[$i].port // \"8080\"" "$norm")"
++    a_conf="$(jq -r ".apis[$i].configFile // empty" "$norm")"
++    dbRef="$(jq -r ".apis[$i].dbRef // empty" "$norm")"
++
++    local apiid; apiid="$(safe_id "$id")"
++    local svc="${site}-api-${apiid}"
++
++    echo "  ${svc}:" >> "$out"
++    if [ -n "$a_image" ] && [ "$a_image" != "null" ]; then
++      echo "    image: ${a_image}" >> "$out"
++    else
++      echo "    build:" >> "$out"
++      echo "      context: ${a_build}" >> "$out"
++    fi
++
++    cat >> "$out" <<YAML
++    container_name: ${svc}
++    networks: [${NETWORK_NAME}, ${site_net}]
++    expose: ["${a_port}"]
++YAML
++
++    if [ -n "$dbRef" ] && [ "$dbRef" != "null" ]; then
++      local dbid; dbid="$(safe_id "$dbRef")"
++      local dbsvc="${site}-db-${dbid}"
++      if jq -e --arg id "$dbRef" '.dbs[]? | select(.id==$id)' "$norm" >/dev/null 2>&1; then
++        cat >> "$out" <<YAML
++    depends_on:
++      ${dbsvc}:
++        condition: service_healthy
++YAML
++      fi
++    fi
++
++    local api_volumes_json; api_volumes_json="$(jq -c ".apis[$i].volumes // []" "$norm")"
++    if { [ -n "$a_conf" ] && [ "$a_conf" != "null" ]; } || [ "$api_volumes_json" != "[]" ]; then
++      echo "    volumes:" >> "$out"
++      if [ -n "$a_conf" ] && [ "$a_conf" != "null" ]; then
++        echo "      - ${a_conf}:/config/application.properties:ro" >> "$out"
++      fi
++      if [ "$api_volumes_json" != "[]" ]; then
++        echo "$api_volumes_json" | jq -r '.[]' | while read -r vol; do
++          [ -z "$vol" ] && continue
++          echo "      - ${vol}" >> "$out"
++        done
++      fi
++    fi
++
++    # legacy apiDomain: apply to first api only
++    if [ -n "$apiDomain" ] && [ "$apiDomain" != "null" ] && [ "$i" -eq 0 ]; then
++      cat >> "$out" <<YAML
++    environment:
++      - VIRTUAL_HOST=${apiDomain}
++YAML
++    fi
++
++    echo "    restart: unless-stopped" >> "$out"
++    echo >> "$out"
++  done
+ }
+
+@@ -344,36 +566,33 @@ compose_add_frontend() {
+   echo >> "$out"
+ }
+
+ compose_finalize() {
+   local norm="$1" out="$2"
+-  local name db_engine svc
+-  name="$(json_get '.name' "$norm")"
+-  svc="$(safe_id "$name")"
+-  db_engine="$(json_get '.db.engine' "$norm")"
++  local site_name site site_net
++  site_name="$(json_get '.name' "$norm")"
++  site="$(safe_id "$site_name")"
++  site_net="${site}_internal"
+
+   {
+     echo 'volumes:'
+-    echo '  db-data:'
++    local len; len="$(jq '.dbs | length' "$norm")"
++    if [ "$len" -gt 0 ]; then
++      for i in $(seq 0 $((len-1))); do
++        local id; id="$(jq -r ".dbs[$i].id // \"db\"" "$norm")"
++        echo "  db-$(safe_id "$id")-data:"
++      done
++    fi
+     echo
+     echo 'networks:'
+     cat <<NETS
+   ${NETWORK_NAME}:
+     external: true
+ NETS
+-    if [ -n "$db_engine" ] && [ "$db_engine" != "null" ]; then
+-      cat <<NETS
+-  ${svc}_internal:
+-    name: ${svc}_internal
+-    driver: bridge
+-NETS
+-    fi
++    cat <<NETS
++  ${site_net}:
++    name: ${site_net}
++    driver: bridge
++NETS
+   } >> "$out"
+ }
+
+@@ -404,53 +623,74 @@ write_vhost_rules() {
+   local norm="$1"
+-  local name localHost domain a_port strip prefixes_json svc
++  local name localHost domain svc
+   name="$(json_get '.name' "$norm")"
+   svc="$(safe_id "$name")"
+   localHost="$(json_get '.localHost' "$norm")"
+   domain="$(json_get '.domain' "$norm")"
+-  a_port="$(json_get '.api.port' "$norm")"; [ -z "$a_port" ] && a_port="8080"
+-  strip="$(json_get '.paths.stripApiPrefix' "$norm")"
+-  prefixes_json="$(jq -c '.paths.apiPrefixes // ["/api/"]' "$norm")"
++  local routes_len; routes_len="$(jq '.routes | length' "$norm")"
+
+   mkdir -p "${PROXY_DIR}/vhost.d"
+   local hosts=("$localHost")
+   if [ -n "$domain" ] && [ "$domain" != "null" ]; then
+     hosts+=("$domain")
+     case "$domain" in
+       www.*) ;;  # already www
+       *.*) hosts+=("www.${domain}") ;;
+     esac
+   fi
+
+   # Build the content once (no reload here; caller will reload after containers are up)
+   for host in "${hosts[@]}"; do
+     local tmp_file="${PROXY_DIR}/vhost.d/.${host}.tmp"
+     : > "$tmp_file"
+
+-    if [ "$(json_get '.type' "$norm")" = "fullstack" ]; then
+-      echo "${prefixes_json}" | jq -r '.[]' | while read -r prefix; do
+-        case "$prefix" in */) : ;; *) prefix="${prefix}/";; esac
+-        if [ "$strip" = "true" ]; then
+-          cat >> "$tmp_file" <<EOP
+-location ${prefix} {
+-  proxy_pass http://${svc}-api:${a_port}/;
+-  proxy_set_header Host \$host;
+-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+-  proxy_set_header X-Forwarded-Proto \$scheme;
+-  proxy_read_timeout 300;
+-}
+-EOP
+-        else
+-          cat >> "$tmp_file" <<EOP
+-location ${prefix} {
+-  proxy_pass http://${svc}-api:${a_port}${prefix};
+-  proxy_set_header Host \$host;
+-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+-  proxy_set_header X-Forwarded-Proto \$scheme;
+-  proxy_read_timeout 300;
+-}
+-EOP
+-        fi
+-      done
+-    fi
++    if [ "$(json_get '.type' "$norm")" = "fullstack" ] && [ "$routes_len" -gt 0 ]; then
++      for r in $(seq 0 $((routes_len-1))); do
++        local prefix apiRef strip a_port apisvc
++        prefix="$(jq -r ".routes[$r].prefix // \"/api/\"" "$norm")"
++        apiRef="$(jq -r ".routes[$r].apiRef // \"api\"" "$norm")"
++        strip="$(jq -r ".routes[$r].stripPrefix // \"false\"" "$norm")"
++        case "$prefix" in */) : ;; *) prefix="${prefix}/";; esac
++
++        a_port="$(jq -r --arg id "$apiRef" '.apis[]? | select(.id==$id) | .port' "$norm" | head -n1)"
++        [ -z "$a_port" ] && a_port="8080"
++        apisvc="${svc}-api-$(safe_id "$apiRef")"
++
++        if [ "$strip" = "true" ]; then
++          cat >> "$tmp_file" <<EOP
++location ${prefix} {
++  proxy_pass http://${apisvc}:${a_port}/;
++  proxy_set_header Host \$host;
++  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
++  proxy_set_header X-Forwarded-Proto \$scheme;
++  proxy_read_timeout 300;
++}
++EOP
++        else
++          cat >> "$tmp_file" <<EOP
++location ${prefix} {
++  proxy_pass http://${apisvc}:${a_port}${prefix};
++  proxy_set_header Host \$host;
++  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
++  proxy_set_header X-Forwarded-Proto \$scheme;
++  proxy_read_timeout 300;
++}
++EOP
++        fi
++      done
++    fi
+
+     # Atomic replace
+     sudo mv "$tmp_file" "${PROXY_DIR}/vhost.d/${host}"
+     echo "Wrote vhost rules: vhost.d/${host}"
+   done
+ }
+
+@@ -538,13 +778,13 @@ write_site_compose() {
+   local compose_path="${site_dir}/docker-compose.yml"
+   compose_init "$compose_path"
+-  compose_add_db "$norm_file" "$compose_path"
+-  compose_add_api "$norm_file" "$compose_path"
++  compose_add_dbs "$norm_file" "$compose_path"
++  compose_add_apis "$norm_file" "$compose_path"
+   compose_add_frontend "$norm_file" "$compose_path" "$site_dir"
+   compose_finalize "$norm_file" "$compose_path"
+
+   # Also write normalized config for visibility
+   cp "$norm_file" "${site_dir}/site.normalized.json" 2>/dev/null || true
+@@ -583,14 +823,44 @@ site_up_api() {
+-  local name="$1" svc
+-  svc="$(safe_id "$name")"
+-  (cd "${BASE_DIR}/${name}" && sudo docker compose up -d --build "${svc}-api")
++  # site_up_api <siteName> [apiId]
++  local name="$1" apiId="${2:-}" site svc
++  site="$(safe_id "$name")"
++
++  if [ -z "$apiId" ]; then
++    # bring all api services up
++    local norm_file; norm_file="$(mktemp)"
++    normalize_config "${BASE_DIR}/${name}/site.json" > "$norm_file"
++    local len; len="$(jq '.apis|length' "$norm_file")"
++    if [ "$len" -gt 0 ]; then
++      local services=()
++      for i in $(seq 0 $((len-1))); do
++        local id; id="$(jq -r ".apis[$i].id" "$norm_file")"
++        services+=("${site}-api-$(safe_id "$id")")
++      done
++      (cd "${BASE_DIR}/${name}" && sudo docker compose up -d --build "${services[@]}")
++    fi
++    rm -f "$norm_file"
++  else
++    svc="${site}-api-$(safe_id "$apiId")"
++    (cd "${BASE_DIR}/${name}" && sudo docker compose up -d --build "${svc}")
++  fi
+ }
+
+@@ -691,18 +961,29 @@ cmd_add_update() {
+   local svc="$(safe_id "$(json_get '.name' "$norm_file")")"
+   local f_port="$(json_get '.frontend.port' "$norm_file")"; [ -z "$f_port" ] && f_port="80"
+   wait_service_ready "${svc}-front" "$f_port" 30 || true
+
+   if [ "$(json_get '.type' "$norm_file")" = "fullstack" ]; then
+-    local a_port="$(json_get '.api.port' "$norm_file")"; [ -z "$a_port" ] && a_port="8080"
+-    wait_service_ready "${svc}-api" "$a_port" 30 || true
++    local alen; alen="$(jq '.apis|length' "$norm_file")"
++    if [ "$alen" -gt 0 ]; then
++      for i in $(seq 0 $((alen-1))); do
++        local id a_port
++        id="$(jq -r ".apis[$i].id" "$norm_file")"
++        a_port="$(jq -r ".apis[$i].port // \"8080\"" "$norm_file")"
++        wait_service_ready "${svc}-api-$(safe_id "$id")" "$a_port" 30 || true
++      done
++    fi
+   fi
+
+   # 3) Now write vhost rules atomically and reload
+   write_vhost_rules "$norm_file"
+   reload_proxy
+
+@@ -1392,9 +1673,135 @@ # ---------- DB Helpers ----------
+-db_container_name() { local cfg="$1"; local n="$(json_get '.name' "$cfg")"; local s="$(safe_id "$n")"; echo "${s}-db"; }
+-db_engine()        { local e; e="$(json_get '.db.engine' "$1")"; [ -z "$e" ] && e="mysql"; echo "$e"; }
++# Multi-DB helpers:
++# - add --db <id> to db commands
++# - default: prefer id "main" if exists, else first dbs[0], else legacy "db"
++pick_db_id() {
++  local norm="$1" wanted="${2:-}"
++  if [ -n "$wanted" ]; then echo "$wanted"; return 0; fi
++  if jq -e '.dbs[]? | select(.id=="main")' "$norm" >/dev/null 2>&1; then echo "main"; return 0; fi
++  jq -r '.dbs[0].id // "db"' "$norm"
++}
++
++db_service_name() {
++  local norm="$1" dbid="${2:-}"
++  local site="$(safe_id "$(json_get '.name' "$norm")")"
++  local use; use="$(pick_db_id "$norm" "$dbid")"
++  echo "${site}-db-$(safe_id "$use")"
++}
++
++db_engine_for() {
++  local norm="$1" dbid="${2:-}"
++  local use; use="$(pick_db_id "$norm" "$dbid")"
++  jq -r --arg id "$use" '.dbs[]? | select(.id==$id) | .engine' "$norm" | head -n1
++}
++
++db_fields_for() {
++  # prints: name|user|pass|root|version
++  local norm="$1" dbid="${2:-}"
++  local use; use="$(pick_db_id "$norm" "$dbid")"
++  jq -r --arg id "$use" '
++    (.dbs[]? | select(.id==$id)) as $d
++    | "\($d.name // "")|\($d.user // "")|\($d.password // "")|\($d.rootPassword // "")|\($d.version // "")"
++  ' "$norm" | head -n1
++}
+
+ db_mysql_client() {
+-  local cfg="$1"; shift
+-  local n="$(json_get '.name' "$cfg")"; local s="$(safe_id "$n")"
+-  local net="${s}_internal"
++  local norm="$1"; shift
++  local s="$(safe_id "$(json_get '.name' "$norm")")"
++  local net="${s}_internal"
+   if ! sudo docker network inspect "$net" >/dev/null 2>&1; then
+     net="$(sudo docker network ls --format '{{.Name}}' | awk -v n="${s}_internal" '$0 ~ "_" n "$" {print; exit}')"
+     [ -n "$net" ] || { echo "Network ${s}_internal not found"; exit 1; }
+   fi
+   sudo docker run --rm -i --network "$net" --entrypoint mysql mysql:8 --ssl-mode=DISABLED "$@"
+ }
+
+ db_mariadb_client() {
+-  local cfg="$1"; shift
+-  local n="$(json_get '.name' "$cfg")"; local s="$(safe_id "$n")"
+-  local net="${s}_internal"
++  local norm="$1"; shift
++  local s="$(safe_id "$(json_get '.name' "$norm")")"
++  local net="${s}_internal"
+   if ! sudo docker network inspect "$net" >/dev/null 2>&1; then
+     net="$(sudo docker network ls --format '{{.Name}}' | awk -v n="${s}_internal" '$0 ~ "_" n "$" {print; exit}')"
+     [ -n "$net" ] || { echo "Network ${s}_internal not found"; exit 1; }
+   fi
+   sudo docker run --rm -i --network "$net" --entrypoint mariadb mariadb:11 --ssl=0 "$@"
+ }
+
+ cmd_db_create() {
+-  local cfg="$1"; [ -f "$cfg" ] || { echo "Config not found: $cfg"; exit 1; }
+-  local tmp; tmp="$(mktemp)"; normalize_config "$cfg" > "$tmp"
+-  local engine="$(db_engine "$tmp")"
+-  local dbname="$(json_get '.db.name' "$tmp")"
+-  local dbuser="$(json_get '.db.user' "$tmp")"
+-  local dbpass="$(json_get '.db.password' "$tmp")"
+-  local rootpw="$(json_get '.db.rootPassword' "$tmp")"
+-  [ -n "$dbname" ] || { echo ".db.name missing"; exit 1; }
++  # Usage: flux db create <site.json> [--db ID]
++  local cfg="$1"; shift || true
++  [ -f "$cfg" ] || { echo "Config not found: $cfg"; exit 1; }
++  local dbid=""
++  while [ $# -gt 0 ]; do
++    case "$1" in
++      --db) dbid="${2:-}"; shift 2;;
++      *) break;;
++    esac
++  done
++  local tmp; tmp="$(mktemp)"; normalize_config "$cfg" > "$tmp"
++  local use; use="$(pick_db_id "$tmp" "$dbid")"
++  local engine; engine="$(db_engine_for "$tmp" "$use")"
++  local fields; fields="$(db_fields_for "$tmp" "$use")"
++  IFS='|' read -r dbname dbuser dbpass rootpw _ver <<<"$fields"
++  [ -n "$dbname" ] || { echo "db name missing for id=$use"; rm -f "$tmp"; exit 1; }
++  local host; host="$(db_service_name "$tmp" "$use")"
+   case "$engine" in
+     mysql|mariadb)
+       local stmt="CREATE DATABASE IF NOT EXISTS \`$dbname\`;"
+       if [ -n "$dbuser" ] && [ -n "$dbpass" ]; then
+         stmt="$stmt CREATE USER IF NOT EXISTS '$dbuser'@'%' IDENTIFIED BY '$dbpass'; GRANT ALL PRIVILEGES ON \`$dbname\`.* TO '$dbuser'@'%'; FLUSH PRIVILEGES;"
+       fi
+       if [ "$engine" = "mysql" ]; then
+-        printf "%s" "$stmt" | db_mysql_client "$tmp" -h "$(db_container_name "$tmp")" -uroot "-p${rootpw}"
++        printf "%s" "$stmt" | db_mysql_client "$tmp" -h "$host" -uroot "-p${rootpw}"
+       else
+-        printf "%s" "$stmt" | db_mariadb_client "$tmp" -h "$(db_container_name "$tmp")" -uroot "-p${rootpw}"
++        printf "%s" "$stmt" | db_mariadb_client "$tmp" -h "$host" -uroot "-p${rootpw}"
+       fi
+-      echo "DB created (engine=$engine, name=$dbname)."
++      echo "DB created (engine=$engine, id=$use, name=$dbname)."
+       ;;
+     *)
+       # TODO(Postgres): add postgres create
+       echo "Engine '$engine' not supported yet for create."; rm -f "$tmp"; exit 1;;
+   esac
+   rm -f "$tmp"
+ }
+
+ cmd_db_dump() {
+-  local cfg="$1" out="${2:-}"
+-  [ -n "$out" ] || { echo "Usage: $PROG db dump <site.json> <outfile.sql>"; exit 1; }
+-  local tmp; tmp="$(mktemp)"; normalize_config "$cfg" > "$tmp"
+-  local engine="$(db_engine "$tmp")"
+-  local name="$(json_get '.name' "$tmp")"
+-  local dbname="$(json_get '.db.name' "$tmp")"
+-  local rootpw="$(json_get '.db.rootPassword' "$tmp")"
+-  local n="$(json_get '.name' "$tmp")"; local s="$(safe_id "$n")"
++  # Usage: flux db dump <site.json> <outfile.sql> [--db ID]
++  local cfg="$1" out="${2:-}"; shift 2 || true
++  [ -n "$out" ] || { echo "Usage: $PROG db dump <site.json> <outfile.sql> [--db ID]"; exit 1; }
++  local dbid=""
++  while [ $# -gt 0 ]; do
++    case "$1" in
++      --db) dbid="${2:-}"; shift 2;;
++      *) break;;
++    esac
++  done
++  local tmp; tmp="$(mktemp)"; normalize_config "$cfg" > "$tmp"
++  local use; use="$(pick_db_id "$tmp" "$dbid")"
++  local engine; engine="$(db_engine_for "$tmp" "$use")"
++  local fields; fields="$(db_fields_for "$tmp" "$use")"
++  IFS='|' read -r dbname _u _p rootpw _ver <<<"$fields"
++  local s="$(safe_id "$(json_get '.name' "$tmp")")"
++  local host; host="$(db_service_name "$tmp" "$use")"
+   case "$engine" in
+     mysql|mariadb)
+       local img="mysql:8"; [ "$engine" = "mariadb" ] && img="mariadb:11"
+       sudo docker run --rm --network "${s}_internal" "$img" \
+-          sh -c "mysqldump -h $(db_container_name "$tmp") -uroot -p${rootpw} --routines --triggers --events ${dbname}" > "$out"
+-      echo "Dump written to $out"
++          sh -c "mysqldump -h ${host} -uroot -p${rootpw} --routines --triggers --events ${dbname}" > "$out"
++      echo "Dump written to $out (db=$use)"
+       ;;
+     *)
+       # TODO(Postgres): add postgres dump
+       echo "Engine '$engine' dump not supported yet."; rm -f "$tmp"; exit 1;;
+   esac
+   rm -f "$tmp"
+ }
+
+ cmd_db_restore() {
+-  local cfg="$1" infile="$2"
++  local cfg="$1" infile="$2"; shift 2 || true
+   [ -f "$cfg" ]   || { echo "Site JSON not found: $cfg"; exit 1; }
+   [ -f "$infile" ]|| { echo "Dump file not found: $infile"; exit 1; }
++  local dbid=""
++  while [ $# -gt 0 ]; do
++    case "$1" in
++      --db) dbid="${2:-}"; shift 2;;
++      *) break;;
++    esac
++  done
+
+   local tmp; tmp="$(mktemp)"; normalize_config "$cfg" > "$tmp"
+-  local name="$(json_get '.name' "$tmp")"
+-  local engine="$(json_get '.db.engine' "$tmp")"
+-  local dbname="$(json_get '.db.name' "$tmp")"
+-  local rootpw="$(json_get '.db.rootPassword' "$tmp")"
+-  [ -n "$dbname" ] && [ "$dbname" != "null" ] || { echo "Database name missing in site.json (.db.name)."; rm -f "$tmp"; exit 1; }
+-  [ -n "$rootpw" ] && [ "$rootpw" != "null" ] || { echo "Root password missing in site.json (.db.rootPassword)."; rm -f "$tmp"; exit 1; }
+-
+-  local host client
+-  host="$(db_container_name "$tmp")"
+-  client="db_mysql_client"; [ "$engine" = "mariadb" ] && client="db_mariadb_client"
++  local use; use="$(pick_db_id "$tmp" "$dbid")"
++  local engine; engine="$(db_engine_for "$tmp" "$use")"
++  local fields; fields="$(db_fields_for "$tmp" "$use")"
++  IFS='|' read -r dbname _u _p rootpw _ver <<<"$fields"
++  [ -n "$dbname" ] || { echo "Database name missing for db id=$use"; rm -f "$tmp"; exit 1; }
++  [ -n "$rootpw" ] || { echo "Root password missing for db id=$use"; rm -f "$tmp"; exit 1; }
++  local host client
++  host="$(db_service_name "$tmp" "$use")"
++  client="db_mysql_client"; [ "$engine" = "mariadb" ] && client="db_mariadb_client"
+
+   # Ensure DB exists before import
+   $client "$tmp" -h "$host" -uroot "-p${rootpw}" \
+     -e "CREATE DATABASE IF NOT EXISTS \`${dbname}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+@@ -1510,7 +1917,7 @@ cmd_db_restore() {
+   else
+     filter_dump < "$infile" | $client "$tmp" -h "$host" -uroot "-p${rootpw}" "${dbname}"
+   fi
+
+-  echo "Restored ${infile} into ${dbname} (engine=${engine}, site=${name})."
++  echo "Restored ${infile} into ${dbname} (engine=${engine}, dbId=${use})."
+
+   echo
+   echo "----- Table overview for ${dbname} -----"
+@@ -1562,7 +1969,10 @@ usage() {
+ Database:
+-  db create   <site.json>          Ensure database/user exists (mysql|mariadb)
+-  db dump     <site.json> <out.sql>
+-  db restore  <site.json> <in.sql|.sql.gz>
++  db create   <site.json> [--db ID]          Ensure database/user exists (mysql|mariadb)
++  db dump     <site.json> <out.sql> [--db ID]
++  db restore  <site.json> <in.sql|.sql.gz> [--db ID]
++
++Multi:
++  apis[] / dbs[] / routes[] supported (backwards compatible with .api/.db/.paths.apiPrefixes)
+
+ USAGE
+ }
