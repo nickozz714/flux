@@ -1,0 +1,117 @@
+diff --git a/bin/flux b/bin/flux
+index 0000000..0000000 100755
+--- a/bin/flux
++++ b/bin/flux
+@@ -1,6 +1,6 @@
+ #!/usr/bin/env bash
+ # flux — Manage multi-site Docker deployments behind nginx-proxy + Cloudflare tunnels.
+ # Requires: bash, docker, docker compose plugin, jq, iptables/ip6tables
+@@ -560,12 +560,34 @@ write_site_compose() {
+ # ---------- Runtime Controls ----------
+
+ site_up()       { (cd "${BASE_DIR}/$1" && sudo docker compose up -d --build); }
+ site_up_force() { (cd "${BASE_DIR}/$1" && sudo docker compose build --no-cache --pull && sudo docker compose up -d --force-recreate); }
+ site_down()     { (cd "${BASE_DIR}/$1" && sudo docker compose down || true); }
+
++site_up_nocache() {
++  (cd "${BASE_DIR}/$1" && sudo docker compose build --no-cache --pull && sudo docker compose up -d)
++}
++
+ site_up_front() {
+   local name="$1" svc
+   svc="$(safe_id "$name")"
+   (cd "${BASE_DIR}/${name}" && sudo docker compose up -d --build "${svc}-front")
+ }
+
++site_up_front_nocache() {
++  local name="$1" svc
++  svc="$(safe_id "$name")"
++  (cd "${BASE_DIR}/${name}" && sudo docker compose build --no-cache --pull "${svc}-front" && sudo docker compose up -d "${svc}-front")
++}
++
+ site_up_api() {
+   local name="$1" svc
+   svc="$(safe_id "$name")"
+   (cd "${BASE_DIR}/${name}" && sudo docker compose up -d --build "${svc}-api")
+ }
+
++site_up_api_nocache() {
++  local name="$1" svc
++  svc="$(safe_id "$name")"
++  (cd "${BASE_DIR}/${name}" && sudo docker compose build --no-cache --pull "${svc}-api" && sudo docker compose up -d "${svc}-api")
++}
++
+@@ -620,7 +642,22 @@ connect_to_external_db_network() {
+
+ # ---------- Commands ----------
+
+ cmd_add_update() {
+-  local cfg="$1"; local mode="$2"
++  local cfg="$1"; local mode="$2"; shift 2 || true
++  local nocache="no"
++
++  while [ $# -gt 0 ]; do
++    case "$1" in
++      --no-cache) nocache="yes" ;;
++      *) echo "Unknown option: $1"; exit 1 ;;
++    esac
++    shift || true
++  done
++
+   [ -f "$cfg" ] || { echo "Config not found: $cfg"; exit 1; }
+   ensure_network; init_proxy
+   local name; name="$(json_get '.name' "$cfg")"
+   [ -n "$name" ] || { echo ".name missing in $cfg"; exit 1; }
+@@ -652,19 +689,33 @@ cmd_add_update() {
+
+     # 1) Bring services up first (so upstreams exist on proxy_net)
+     case "$mode" in
+       add)
+-        site_up "$name"
++        if [ "$nocache" = "yes" ]; then
++          site_up_nocache "$name"
++        else
++          site_up "$name"
++        fi
+         ;;
+       update)
+         site_up_force "$name"
+         ;;
+       update-front)
+-        site_up_front "$name"
++        if [ "$nocache" = "yes" ]; then
++          site_up_front_nocache "$name"
++        else
++          site_up_front "$name"
++        fi
+         ;;
+       update-api)
+-        site_up_api "$name"
++        if [ "$nocache" = "yes" ]; then
++          site_up_api_nocache "$name"
++        else
++          site_up_api "$name"
++        fi
+         ;;
+       *)
+         echo "Unknown cmd_add_update mode: $mode" >&2
+         site_up "$name"
+@@ -1700,10 +1751,10 @@ main() {
+
+   case "$cmd" in
+     --version|-v|version) echo "flux ${VERSION}"; exit 0 ;;
+     init)              require docker; ensure_network; init_proxy; echo "Init complete." ;;
+     fresh)             ensure_network; fresh "$@" ;;
+     setup-tunnel)     [ $# -ge 1 ] || { echo "Usage: $PROG setup-tunnel <CLOUDFLARE_TUNNEL_TOKEN>"; exit 1; }; ensure_network; init_proxy; setup_tunnel "$@" ;;
+-    add)               [ $# -ge 1 ] || { usage; exit 1; }; cmd_add_update "$1" "add" ;;
+-    update)            [ $# -ge 1 ] || { usage; exit 1; }; cmd_add_update "$1" "update" ;;
+-    update-front)      [ $# -ge 1 ] || { usage; exit 1; }; cmd_add_update "$1" "update-front" ;;
+-    update-api)        [ $# -ge 1 ] || { usage; exit 1; }; cmd_add_update "$1" "update-api" ;;
++    add)               [ $# -ge 1 ] || { usage; exit 1; }; cfg="$1"; shift; cmd_add_update "$cfg" "add" "$@" ;;
++    update)            [ $# -ge 1 ] || { usage; exit 1; }; cfg="$1"; shift; cmd_add_update "$cfg" "update" "$@" ;;
++    update-front)      [ $# -ge 1 ] || { usage; exit 1; }; cfg="$1"; shift; cmd_add_update "$cfg" "update-front" "$@" ;;
++    update-api)        [ $# -ge 1 ] || { usage; exit 1; }; cfg="$1"; shift; cmd_add_update "$cfg" "update-api" "$@" ;;
+
+     remove)            [ $# -ge 1 ] || { usage; exit 1; }; cmd_remove "$@" ;;
+     list)              cmd_list ;;
+     volumes)           cmd_volumes ;;

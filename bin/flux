@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-VERSION="0.7.1 - ALPHA"
+VERSION="0.8.0 - ALPHA"
 PROG="${0##*/}"
 
 BASE_DIR="/Server/Applications"
@@ -306,38 +306,89 @@ normalize_config() {
             volumes: (.frontend.volumes // [])
           }
         ),
-        api: (
-          if (.type // "static") == "fullstack" then
-            {
-              build: (.api.build // "./api"),
-              image: (.api.image // null),
-              port: ((.api.port // 8080)|tostring),
-              configFile: (.api.configFile // null),
-              volumes: (.api.volumes // [])
-            }
-          else
-            null
-          end
-        ),
-        db: (
-          if (.db // null) == null then
-            { engine: "mysql", name: null, user: null, password: null, rootPassword: null, initSql: null, version: null }
-          else
-            {
-              engine: (if (.db.engine // null) == null then "mysql" else .db.engine end),
-              name: (.db.name // .db.database // null),
-              user: (.db.user // null),
-              password: (.db.password // null),
-              rootPassword: (.db.rootPassword // null),
-              initSql: (.db.initSql // null),
-              version: (.db.version // null)
-            }
-          end
-        ),
-        paths: {
-          apiPrefixes: (.paths.apiPrefixes // ["/api/"]),
-          stripApiPrefix: ((.paths.stripApiPrefix // false)|tostring)
-        },
+                apis: (
+                  if (.type // "static") == "fullstack" then
+                    (
+                      if (.apis // null) != null then
+                        (.apis | map({
+                          id: (.id // "api"),
+                          build: (.build // "./api"),
+                          image: (.image // null),
+                          port: ((.port // 8080) | tostring),
+                          configFile: (.configFile // null),
+                          volumes: (.volumes // [])
+                        }))
+                      else
+                        [{
+                          id: "api",
+                          build: (.api.build // "./api"),
+                          image: (.api.image // null),
+                          port: ((.api.port // 8080) | tostring),
+                          configFile: (.api.configFile // null),
+                          volumes: (.api.volumes // [])
+                        }]
+                      end
+                    )
+                  else
+                    []
+                  end
+                ),
+
+                dbs: (
+                  if (.dbs // null) != null then
+                    (.dbs | map({
+                      id: (.id // "db"),
+                      engine: (if (.engine // null) == null then "mysql" else .engine end),
+                      name: (.name // .database // null),
+                      user: (.user // null),
+                      password: (.password // null),
+                      rootPassword: (.rootPassword // null),
+                      initSql: (.initSql // null),
+                      version: (.version // null)
+                    }))
+                  else
+                    [(
+                      if (.db // null) == null then
+                        { id:"db", engine:"mysql", name:null, user:null, password:null, rootPassword:null, initSql:null, version:null }
+                      else
+                        {
+                          id: "db",
+                          engine: (if (.db.engine // null) == null then "mysql" else .db.engine end),
+                          name: (.db.name // .db.database // null),
+                          user: (.db.user // null),
+                          password: (.db.password // null),
+                          rootPassword: (.db.rootPassword // null),
+                          initSql: (.db.initSql // null),
+                          version: (.db.version // null)
+                        }
+                      end
+                    )]
+                  end
+                ),
+                api: (.api // null),
+                db:  (.db  // null),
+                paths: {
+                  apiPrefixes: (.paths.apiPrefixes // ["/api/"]),
+                  stripApiPrefix: ((.paths.stripApiPrefix // false)|tostring),
+
+                  # NEW: per-prefix routing to different APIs
+                  # If not provided, we build a single route from apiPrefixes -> first api (or apiTargetApiId if set)
+                  apiRoutes: (
+                    if (.paths.apiRoutes // null) != null then
+                      (.paths.apiRoutes | map({
+                        prefixes: (.prefixes // ["/api/"]),
+                        targetApiId: (.targetApiId // "api"),
+                        strip: ((.strip // (.paths.stripApiPrefix // false)) | tostring)
+                      }))
+                    else
+                      [ {
+                        prefixes: (.paths.apiPrefixes // ["/api/"]),
+                        targetApiId: (.paths.apiTargetApiId // (if (.apis // null) != null and ((.apis|length)>0) then (.apis[0].id // "api") else "api" end)),
+                        strip: ((.paths.stripApiPrefix // false) | tostring)
+                      } ]
+                    end
+                  )
+                },
         useExternalDbOf: (.useExternalDbOf // "")
       }
   ' "$cfg"
@@ -356,26 +407,40 @@ compose_init() {
 
 compose_add_db() {
   local norm="$1" out="$2"
-  local name db_engine db_name db_user db_pass db_root db_init db_ver svc
+  local name svc dbs_len
   name="$(json_get '.name' "$norm")"
   svc="$(safe_id "$name")"
-  db_engine="$(json_get '.db.engine' "$norm")"
-  db_name="$(json_get '.db.name' "$norm")"
-  db_user="$(json_get '.db.user' "$norm")"
-  db_pass="$(json_get '.db.password' "$norm")"
-  db_root="$(json_get '.db.rootPassword' "$norm")"
-  db_init="$(json_get '.db.initSql' "$norm")"
-  db_ver="$(json_get '.db.version' "$norm")"
 
-  [ -n "$db_engine" ] && [ "$db_engine" != "null" ] || return 0
+  # dbs[] is normalized; if empty, do nothing
+  dbs_len="$(jq -r '.dbs | length' "$norm" 2>/dev/null || echo 0)"
+  [ "${dbs_len:-0}" -gt 0 ] || return 0
 
-  case "$db_engine" in
-    mysql|mariadb)
-      local img="mysql:8"; [ "$db_engine" = "mariadb" ] && img="mariadb:${db_ver:-11}"
-      cat >> "$out" <<YAML
-  ${svc}-db:
+  for i in $(seq 0 $((dbs_len-1))); do
+    local db_id db_engine db_name db_user db_pass db_root db_init db_ver db_svc vol_name
+    db_id="$(jq -r ".dbs[$i].id // \"db$((i+1))\"" "$norm")"
+    db_engine="$(jq -r ".dbs[$i].engine // \"mysql\"" "$norm")"
+    db_name="$(jq -r ".dbs[$i].name // empty" "$norm")"
+    db_user="$(jq -r ".dbs[$i].user // empty" "$norm")"
+    db_pass="$(jq -r ".dbs[$i].password // empty" "$norm")"
+    db_root="$(jq -r ".dbs[$i].rootPassword // empty" "$norm")"
+    db_init="$(jq -r ".dbs[$i].initSql // empty" "$norm")"
+    db_ver="$(jq -r ".dbs[$i].version // empty" "$norm")"
+
+    # allow disabling a db entry by engine=null or engine="none"
+    if [ -z "$db_engine" ] || [ "$db_engine" = "null" ] || [ "$db_engine" = "none" ]; then
+      continue
+    fi
+
+    db_svc="${svc}-db-${db_id}"
+    vol_name="${svc}_db-data-${db_id}"
+
+    case "$db_engine" in
+      mysql|mariadb)
+        local img="mysql:8"; [ "$db_engine" = "mariadb" ] && img="mariadb:${db_ver:-11}"
+        cat >> "$out" <<YAML
+  ${db_svc}:
     image: ${img}
-    container_name: ${svc}-db
+    container_name: ${db_svc}
     networks: [${svc}_internal]
     environment:
       - MYSQL_ROOT_PASSWORD=${db_root}
@@ -383,7 +448,7 @@ compose_add_db() {
 $( [ -n "$db_user" ] && echo "      - MYSQL_USER=${db_user}" )
 $( [ -n "$db_pass" ] && echo "      - MYSQL_PASSWORD=${db_pass}" )
     volumes:
-      - db-data:/var/lib/mysql
+      - ${vol_name}:/var/lib/mysql
 $( [ -n "$db_init" ] && echo "      - ./${db_init}:/docker-entrypoint-initdb.d/01_init.sql:ro" )
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--password=${db_root}", "--user=root"]
@@ -393,19 +458,19 @@ $( [ -n "$db_init" ] && echo "      - ./${db_init}:/docker-entrypoint-initdb.d/0
     restart: unless-stopped
 
 YAML
-      ;;
-    postgres)
-      cat >> "$out" <<YAML
-  ${svc}-db:
+        ;;
+      postgres)
+        cat >> "$out" <<YAML
+  ${db_svc}:
     image: postgres:${db_ver:-16}
-    container_name: ${svc}-db
+    container_name: ${db_svc}
     networks: [${svc}_internal]
     environment:
       - POSTGRES_PASSWORD=${db_root}
       - POSTGRES_DB=${db_name}
 $( [ -n "$db_user" ] && echo "      - POSTGRES_USER=${db_user}" )
     volumes:
-      - db-data:/var/lib/postgresql/data
+      - ${vol_name}:/var/lib/postgresql/data
 $( [ -n "$db_init" ] && echo "      - ./${db_init}:/docker-entrypoint-initdb.d/01_init.sql:ro" )
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${db_user:-postgres} -d ${db_name}"]
@@ -415,92 +480,111 @@ $( [ -n "$db_init" ] && echo "      - ./${db_init}:/docker-entrypoint-initdb.d/0
     restart: unless-stopped
 
 YAML
-      ;;
-    *)
-      echo "WARN: Unsupported db.engine '${db_engine}' — skipping DB service." ;;
-  esac
+        ;;
+      *)
+        echo "WARN: Unsupported db.engine '${db_engine}' (db id=${db_id}) — skipping." ;;
+    esac
+  done
 }
+
 
 
 compose_add_api() {
   local norm="$1" out="$2"
   local name svc
-  local a_build a_image a_port a_conf apiDomain db_engine
-  local api_volumes_json
-
   name="$(json_get '.name' "$norm")"
   svc="$(safe_id "$name")"
 
   # Only for fullstack sites
   [ "$(json_get '.type' "$norm")" = "fullstack" ] || return 0
 
-  a_build="$(json_get '.api.build' "$norm")"
-  [ -z "$a_build" ] && a_build="./api"
+  local apis_len
+  apis_len="$(jq -r '.apis | length' "$norm" 2>/dev/null || echo 0)"
+  [ "${apis_len:-0}" -gt 0 ] || return 0
 
-  a_image="$(json_get '.api.image' "$norm")"
-
-  a_port="$(json_get '.api.port' "$norm")"
-  [ -z "$a_port" ] && a_port="8080"
-
-  a_conf="$(json_get '.api.configFile' "$norm")"
-  apiDomain="$(json_get '.apiDomain' "$norm")"
-  db_engine="$(json_get '.db.engine' "$norm")"
-
-  # NEW: user-defined volumes from site.json → api.volumes
-  api_volumes_json="$(jq -c '.api.volumes // []' "$norm")"
-
-  echo "  ${svc}-api:" >> "$out"
-
-  if [ -n "$a_image" ] && [ "$a_image" != "null" ]; then
-    echo "    image: ${a_image}" >> "$out"
-  else
-    echo "    build:" >> "$out"
-    echo "      context: ${a_build}" >> "$out"
+  # If at least one DB exists (engine not null/none), depend on all DBs
+  local dbs_len any_db="no"
+  dbs_len="$(jq -r '.dbs | length' "$norm" 2>/dev/null || echo 0)"
+  if [ "${dbs_len:-0}" -gt 0 ]; then
+    for di in $(seq 0 $((dbs_len-1))); do
+      local eng; eng="$(jq -r ".dbs[$di].engine // empty" "$norm")"
+      if [ -n "$eng" ] && [ "$eng" != "null" ] && [ "$eng" != "none" ]; then any_db="yes"; break; fi
+    done
   fi
 
-  cat >> "$out" <<YAML
-    container_name: ${svc}-api
+  for i in $(seq 0 $((apis_len-1))); do
+    local api_id a_build a_image a_port a_conf api_volumes_json apiDomain
+    api_id="$(jq -r ".apis[$i].id // \"api$((i+1))\"" "$norm")"
+    a_build="$(jq -r ".apis[$i].build // \"./api\"" "$norm")"
+    a_image="$(jq -r ".apis[$i].image // empty" "$norm")"
+    a_port="$(jq -r ".apis[$i].port // \"8080\"" "$norm")"
+    a_conf="$(jq -r ".apis[$i].configFile // empty" "$norm")"
+    api_volumes_json="$(jq -c ".apis[$i].volumes // []" "$norm")"
+
+    # apiDomain stays site-level for now (you can add per-api later if you want)
+    apiDomain="$(json_get '.apiDomain' "$norm")"
+
+    local api_svc="${svc}-api-${api_id}"
+
+    echo "  ${api_svc}:" >> "$out"
+
+    if [ -n "$a_image" ] && [ "$a_image" != "null" ]; then
+      echo "    image: ${a_image}" >> "$out"
+    else
+      echo "    build:" >> "$out"
+      echo "      context: ${a_build}" >> "$out"
+    fi
+
+    cat >> "$out" <<YAML
+    container_name: ${api_svc}
     networks: [${NETWORK_NAME}, ${svc}_internal]
     expose: ["${a_port}"]
 YAML
 
-  if [ -n "$db_engine" ] && [ "$db_engine" != "null" ]; then
-    cat >> "$out" <<YAML
-    depends_on:
-      ${svc}-db:
+    if [ "$any_db" = "yes" ]; then
+      echo "    depends_on:" >> "$out"
+      for di in $(seq 0 $((dbs_len-1))); do
+        local db_id db_engine db_svc
+        db_id="$(jq -r ".dbs[$di].id // \"db$((di+1))\"" "$norm")"
+        db_engine="$(jq -r ".dbs[$di].engine // empty" "$norm")"
+        if [ -z "$db_engine" ] || [ "$db_engine" = "null" ] || [ "$db_engine" = "none" ]; then
+          continue
+        fi
+        db_svc="${svc}-db-${db_id}"
+        cat >> "$out" <<YAML
+      ${db_svc}:
         condition: service_healthy
 YAML
-  fi
-
-  # ---- volumes (configFile + api.volumes) ----
-  if { [ -n "$a_conf" ] && [ "$a_conf" != "null" ]; } || [ "$api_volumes_json" != "[]" ]; then
-    echo "    volumes:" >> "$out"
-
-    # configFile mount
-    if [ -n "$a_conf" ] && [ "$a_conf" != "null" ]; then
-      echo "      - ${a_conf}:/config/application.properties:ro" >> "$out"
-    fi
-
-    # user-defined api.volumes
-    if [ "$api_volumes_json" != "[]" ]; then
-      echo "$api_volumes_json" | jq -r '.[]' | while read -r vol; do
-        [ -z "$vol" ] && continue
-        echo "      - ${vol}" >> "$out"
       done
     fi
-  fi
 
-  # Optional dedicated API VIRTUAL_HOST
-  if [ -n "$apiDomain" ]; then
-    cat >> "$out" <<YAML
+    # volumes (configFile + api.volumes)
+    if { [ -n "$a_conf" ] && [ "$a_conf" != "null" ]; } || [ "$api_volumes_json" != "[]" ]; then
+      echo "    volumes:" >> "$out"
+      if [ -n "$a_conf" ] && [ "$a_conf" != "null" ]; then
+        echo "      - ${a_conf}:/config/application.properties:ro" >> "$out"
+      fi
+      if [ "$api_volumes_json" != "[]" ]; then
+        echo "$api_volumes_json" | jq -r '.[]' | while read -r vol; do
+          [ -z "$vol" ] && continue
+          echo "      - ${vol}" >> "$out"
+        done
+      fi
+    fi
+
+    # Optional dedicated API VIRTUAL_HOST (still site-level)
+    if [ -n "$apiDomain" ] && [ "$apiDomain" != "null" ]; then
+      cat >> "$out" <<YAML
     environment:
       - VIRTUAL_HOST=${apiDomain}
 YAML
-  fi
+    fi
 
-  echo "    restart: unless-stopped" >> "$out"
-  echo >> "$out"
+    echo "    restart: unless-stopped" >> "$out"
+    echo >> "$out"
+  done
 }
+
 
 
 compose_add_frontend() {
@@ -521,8 +605,19 @@ compose_add_frontend() {
   local domain localHost front_vhost db_engine
   domain="$(json_get '.domain' "$norm")"
   localHost="$(json_get '.localHost' "$norm")"
-  [ -n "$domain" ] && front_vhost="${localHost},${domain}" || front_vhost="${localHost}"
+
+  # Build VIRTUAL_HOST list: local, domain, and optional www.domain
+  front_vhost="${localHost}"
+  if [ -n "$domain" ] && [ "$domain" != "null" ]; then
+    front_vhost="${front_vhost},${domain}"
+    case "$domain" in
+      www.*) ;;  # already has www
+      *.*) front_vhost="${front_vhost},www.${domain}" ;;
+    esac
+  fi
+
   db_engine="$(json_get '.db.engine' "$norm")"
+
 
   echo "  ${svc}-front:" >> "$out"
 
@@ -579,32 +674,41 @@ YAML
   echo >> "$out"
 }
 
-
 compose_finalize() {
   local norm="$1" out="$2"
-  local name db_engine svc
+  local name svc
   name="$(json_get '.name' "$norm")"
   svc="$(safe_id "$name")"
-  db_engine="$(json_get '.db.engine' "$norm")"
 
   {
     echo 'volumes:'
-    echo '  db-data:'
+    # declare per-db volume(s)
+    local dbs_len; dbs_len="$(jq -r '.dbs | length' "$norm" 2>/dev/null || echo 0)"
+    if [ "${dbs_len:-0}" -gt 0 ]; then
+      for di in $(seq 0 $((dbs_len-1))); do
+        local db_id db_engine
+        db_id="$(jq -r ".dbs[$di].id // \"db$((di+1))\"" "$norm")"
+        db_engine="$(jq -r ".dbs[$di].engine // empty" "$norm")"
+        if [ -z "$db_engine" ] || [ "$db_engine" = "null" ] || [ "$db_engine" = "none" ]; then
+          continue
+        fi
+        echo "  ${svc}_db-data-${db_id}:"
+      done
+    fi
+
     echo
     echo 'networks:'
     cat <<NETS
   ${NETWORK_NAME}:
     external: true
 NETS
-    if [ -n "$db_engine" ] && [ "$db_engine" != "null" ]; then
-      cat <<NETS
-  ${svc}_internal:
-    name: ${svc}_internal
-    driver: bridge
-NETS
-    fi
+    # internal network is needed if any DB exists OR any API exists (we keep it simple)
+    echo "  ${svc}_internal:"
+    echo "    name: ${svc}_internal"
+    echo "    driver: bridge"
   } >> "$out"
 }
+
 
 
 # ---------- Vhost / Replacements ----------
@@ -636,12 +740,32 @@ write_vhost_rules() {
   svc="$(safe_id "$name")"
   localHost="$(json_get '.localHost' "$norm")"
   domain="$(json_get '.domain' "$norm")"
-  a_port="$(json_get '.api.port' "$norm")"; [ -z "$a_port" ] && a_port="8080"
-  strip="$(json_get '.paths.stripApiPrefix' "$norm")"
-  prefixes_json="$(jq -c '.paths.apiPrefixes // ["/api/"]' "$norm")"
+  # Choose which API receives apiPrefixes:
+  # - paths.apiTargetApiId (optional) else first apis[0].id
+  local api_target_id api_target_port api_target_svc
 
-  mkdir -p "${PROXY_DIR}/vhost.d"
-  local hosts=("$localHost"); [ -n "$domain" ] && hosts+=("$domain")
+  api_target_id="$(jq -r '.paths.apiTargetApiId // empty' "$norm")"
+  if [ -z "$api_target_id" ]; then
+    api_target_id="$(jq -r '.apis[0].id // "api"' "$norm" 2>/dev/null || echo "api")"
+  fi
+
+  api_target_port="$(jq -r --arg id "$api_target_id" '.apis[] | select(.id==$id) | .port' "$norm" 2>/dev/null | head -n1)"
+  [ -z "$api_target_port" ] && api_target_port="8080"
+
+  api_target_svc="${svc}-api-${api_target_id}"
+
+  local routes_json
+  routes_json="$(jq -c '.paths.apiRoutes // []' "$norm")"
+
+    mkdir -p "${PROXY_DIR}/vhost.d"
+    local hosts=("$localHost")
+    if [ -n "$domain" ] && [ "$domain" != "null" ]; then
+      hosts+=("$domain")
+      case "$domain" in
+        www.*) ;;  # already www
+        *.*) hosts+=("www.${domain}") ;;
+      esac
+    fi
 
   # Build the content once (no reload here; caller will reload after containers are up)
   for host in "${hosts[@]}"; do
@@ -649,29 +773,42 @@ write_vhost_rules() {
     : > "$tmp_file"
 
     if [ "$(json_get '.type' "$norm")" = "fullstack" ]; then
-      echo "${prefixes_json}" | jq -r '.[]' | while read -r prefix; do
-        case "$prefix" in */) : ;; *) prefix="${prefix}/";; esac
-        if [ "$strip" = "true" ]; then
-          cat >> "$tmp_file" <<EOP
+      # Iterate routes
+      echo "${routes_json}" | jq -c '.[]' | while read -r route; do
+        local target_id target_port target_svc route_strip
+        target_id="$(echo "$route" | jq -r '.targetApiId // "api"')"
+        route_strip="$(echo "$route" | jq -r '.strip // "false"')"
+
+        target_port="$(jq -r --arg id "$target_id" '.apis[] | select(.id==$id) | .port' "$norm" 2>/dev/null | head -n1)"
+        [ -z "$target_port" ] && target_port="8080"
+        target_svc="${svc}-api-${target_id}"
+
+        # Iterate prefixes inside route
+        echo "$route" | jq -r '.prefixes[]' | while read -r prefix; do
+          case "$prefix" in */) : ;; *) prefix="${prefix}/";; esac
+
+          if [ "$route_strip" = "true" ]; then
+            cat >> "$tmp_file" <<EOP
 location ${prefix} {
-  proxy_pass http://${svc}-api:${a_port}/;
+  proxy_pass http://${target_svc}:${target_port}/;
   proxy_set_header Host \$host;
   proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
   proxy_set_header X-Forwarded-Proto \$scheme;
   proxy_read_timeout 300;
 }
 EOP
-        else
-          cat >> "$tmp_file" <<EOP
+          else
+            cat >> "$tmp_file" <<EOP
 location ${prefix} {
-  proxy_pass http://${svc}-api:${a_port}${prefix};
+  proxy_pass http://${target_svc}:${target_port}${prefix};
   proxy_set_header Host \$host;
   proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
   proxy_set_header X-Forwarded-Proto \$scheme;
   proxy_read_timeout 300;
 }
 EOP
-        fi
+          fi
+        done
       done
     fi
 
@@ -899,9 +1036,38 @@ write_site_compose() {
 
 # ---------- Runtime Controls ----------
 
+site_up_nocache() {
+  (cd "${BASE_DIR}/$1" && sudo docker compose build --no-cache --pull && sudo docker compose up -d)
+}
+
+site_up_front_nocache() {
+  local name="$1" svc
+  svc="$(safe_id "$name")"
+  (cd "${BASE_DIR}/${name}" && sudo docker compose build --no-cache --pull "${svc}-front" && sudo docker compose up -d "${svc}-front")
+}
+
+site_up_api_nocache() {
+  local name="$1" svc
+  svc="$(safe_id "$name")"
+  (cd "${BASE_DIR}/${name}" && sudo docker compose build --no-cache --pull "${svc}-api" && sudo docker compose up -d "${svc}-api")
+}
+
 site_up()       { (cd "${BASE_DIR}/$1" && sudo docker compose up -d --build); }
 site_up_force() { (cd "${BASE_DIR}/$1" && sudo docker compose build --no-cache --pull && sudo docker compose up -d --force-recreate); }
 site_down()     { (cd "${BASE_DIR}/$1" && sudo docker compose down || true); }
+
+site_up_front() {
+  local name="$1" svc
+  svc="$(safe_id "$name")"
+  (cd "${BASE_DIR}/${name}" && sudo docker compose up -d --build "${svc}-front")
+}
+
+site_up_api() {
+  local name="$1" svc
+  svc="$(safe_id "$name")"
+  (cd "${BASE_DIR}/${name}" && sudo docker compose up -d --build "${svc}-api")
+}
+
 
 connect_to_external_db_network() {
   local cfg="$1"
@@ -931,7 +1097,17 @@ connect_to_external_db_network() {
 # ---------- Commands ----------
 
 cmd_add_update() {
-  local cfg="$1"; local mode="$2"
+  local cfg="$1"; local mode="$2"; shift 2 || true
+  local nocache="no"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-cache) nocache="yes" ;;
+      *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+    shift || true
+  done
+
   [ -f "$cfg" ] || { echo "Config not found: $cfg"; exit 1; }
   ensure_network; init_proxy
   local name; name="$(json_get '.name' "$cfg")"
@@ -946,22 +1122,44 @@ cmd_add_update() {
   write_site_compose "$cfg"
   apply_front_replacements "$cfg" "${BASE_DIR}/${name}"
 
-  # 1) Bring services up first (so upstreams exist on proxy_net)
-  if [ "$mode" = "update" ]; then
-    site_up_force "$name"
-  else
-    site_up "$name"
-  fi
+    # 1) Bring services up first (so upstreams exist on proxy_net)
+    case "$mode" in
+    add)
+                       if [ "$nocache" = "yes" ]; then site_up_nocache "$name"; else site_up "$name"; fi
+                       ;;
+                     update)
+                       if [ "$nocache" = "yes" ]; then site_up_nocache "$name"; else site_up_force "$name"; fi
+                       ;;
+                     update-front)
+                       if [ "$nocache" = "yes" ]; then site_up_front_nocache "$name"; else site_up_front "$name"; fi
+                       ;;
+                     update-api)
+                       if [ "$nocache" = "yes" ]; then site_up_api_nocache "$name"; else site_up_api "$name"; fi
+                       ;;
+      *)
+        echo "Unknown cmd_add_update mode: $mode" >&2
+        site_up "$name"
+        ;;
+    esac
+
 
   # 2) Wait for front and (if fullstack) api to be reachable from nginx-proxy
   local svc="$(safe_id "$(json_get '.name' "$norm_file")")"
   local f_port="$(json_get '.frontend.port' "$norm_file")"; [ -z "$f_port" ] && f_port="80"
   wait_service_ready "${svc}-front" "$f_port" 30 || true
 
-  if [ "$(json_get '.type' "$norm_file")" = "fullstack" ]; then
-    local a_port="$(json_get '.api.port' "$norm_file")"; [ -z "$a_port" ] && a_port="8080"
-    wait_service_ready "${svc}-api" "$a_port" 30 || true
-  fi
+   if [ "$(json_get '.type' "$norm_file")" = "fullstack" ]; then
+     local apis_len; apis_len="$(jq -r '.apis | length' "$norm_file" 2>/dev/null || echo 0)"
+     if [ "${apis_len:-0}" -gt 0 ]; then
+       for i in $(seq 0 $((apis_len-1))); do
+         local api_id a_port
+         api_id="$(jq -r ".apis[$i].id // \"api$((i+1))\"" "$norm_file")"
+         a_port="$(jq -r ".apis[$i].port // \"8080\"" "$norm_file")"
+         wait_service_ready "${svc}-api-${api_id}" "$a_port" 30 || true
+       done
+     fi
+   fi
+
 
   # 3) Now write vhost rules atomically and reload
   write_vhost_rules "$norm_file"
@@ -2781,7 +2979,10 @@ Core:
 
 Sites:
   add <config.json>                Add new site from JSON (compose + vhost rules)
-  update <config.json>             Update existing site from JSON (rebuild containers)
+  update <config.json>             Update site (API + frontend + DB compose), full rebuild
+  update-front <config.json>       Update only frontend container & vhost rules
+  update-api <config.json>         Update only API container & vhost rules
+
   remove <name> [--keep-data]      Remove site's containers and vhost rules.
                                    By default also removes named volumes (e.g., DB).
                                    Use --keep-data to preserve volumes for reuse.
@@ -2854,8 +3055,12 @@ main() {
     init)              require docker; ensure_network; init_proxy; echo "Init complete." ;;
     fresh)             ensure_network; fresh "$@" ;;
     setup-tunnel)     [ $# -ge 1 ] || { echo "Usage: $PROG setup-tunnel <CLOUDFLARE_TUNNEL_TOKEN>"; exit 1; }; ensure_network; init_proxy; setup_tunnel "$@" ;;
-    add)               [ $# -ge 1 ] || { usage; exit 1; }; cmd_add_update "$1" "add" ;;
-    update)            [ $# -ge 1 ] || { usage; exit 1; }; cmd_add_update "$1" "update" ;;
+    add)         cfg="$1"; shift; cmd_add_update "$cfg" "add" "$@" ;;
+    update)      cfg="$1"; shift; cmd_add_update "$cfg" "update" "$@" ;;
+    update-front) cfg="$1"; shift; cmd_add_update "$cfg" "update-front" "$@" ;;
+    update-api)  cfg="$1"; shift; cmd_add_update "$cfg" "update-api" "$@" ;;
+
+
     remove)            [ $# -ge 1 ] || { usage; exit 1; }; cmd_remove "$@" ;;
     list)              cmd_list ;;
     volumes)           cmd_volumes ;;
