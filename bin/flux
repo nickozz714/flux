@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-VERSION="0.8.0 - ALPHA"
+VERSION="0.9.1 - ALPHA"
 PROG="${0##*/}"
 
 BASE_DIR="/Server/Applications"
@@ -306,89 +306,93 @@ normalize_config() {
             volumes: (.frontend.volumes // [])
           }
         ),
-                apis: (
-                  if (.type // "static") == "fullstack" then
-                    (
-                      if (.apis // null) != null then
-                        (.apis | map({
-                          id: (.id // "api"),
-                          build: (.build // "./api"),
-                          image: (.image // null),
-                          port: ((.port // 8080) | tostring),
-                          configFile: (.configFile // null),
-                          volumes: (.volumes // [])
-                        }))
-                      else
-                        [{
-                          id: "api",
-                          build: (.api.build // "./api"),
-                          image: (.api.image // null),
-                          port: ((.api.port // 8080) | tostring),
-                          configFile: (.api.configFile // null),
-                          volumes: (.api.volumes // [])
-                        }]
-                      end
-                    )
-                  else
-                    []
-                  end
-                ),
-
-                dbs: (
-                  if (.dbs // null) != null then
-                    (.dbs | map({
-                      id: (.id // "db"),
-                      engine: (if (.engine // null) == null then "mysql" else .engine end),
-                      name: (.name // .database // null),
-                      user: (.user // null),
-                      password: (.password // null),
-                      rootPassword: (.rootPassword // null),
-                      initSql: (.initSql // null),
-                      version: (.version // null)
-                    }))
-                  else
-                    [(
-                      if (.db // null) == null then
-                        { id:"db", engine:"mysql", name:null, user:null, password:null, rootPassword:null, initSql:null, version:null }
-                      else
-                        {
-                          id: "db",
-                          engine: (if (.db.engine // null) == null then "mysql" else .db.engine end),
-                          name: (.db.name // .db.database // null),
-                          user: (.db.user // null),
-                          password: (.db.password // null),
-                          rootPassword: (.db.rootPassword // null),
-                          initSql: (.db.initSql // null),
-                          version: (.db.version // null)
-                        }
-                      end
-                    )]
-                  end
-                ),
-                api: (.api // null),
-                db:  (.db  // null),
-                paths: {
-                  apiPrefixes: (.paths.apiPrefixes // ["/api/"]),
-                  stripApiPrefix: ((.paths.stripApiPrefix // false)|tostring),
-
-                  # NEW: per-prefix routing to different APIs
-                  # If not provided, we build a single route from apiPrefixes -> first api (or apiTargetApiId if set)
-                  apiRoutes: (
-                    if (.paths.apiRoutes // null) != null then
-                      (.paths.apiRoutes | map({
-                        prefixes: (.prefixes // ["/api/"]),
-                        targetApiId: (.targetApiId // "api"),
-                        strip: ((.strip // (.paths.stripApiPrefix // false)) | tostring)
-                      }))
-                    else
-                      [ {
-                        prefixes: (.paths.apiPrefixes // ["/api/"]),
-                        targetApiId: (.paths.apiTargetApiId // (if (.apis // null) != null and ((.apis|length)>0) then (.apis[0].id // "api") else "api" end)),
-                        strip: ((.paths.stripApiPrefix // false) | tostring)
-                      } ]
-                    end
-                  )
-                },
+        apis: (
+          if (.type // "static") == "fullstack" then
+            (
+              if (.apis // null) != null then
+                (.apis | map({
+                  id: (.id // "api"),
+                  build: (.build // "./api"),
+                  image: (.image // null),
+                  port: ((.port // 8080) | tostring),
+                  configFile: (.configFile // null),
+                  volumes: (.volumes // []),
+                  buildOptions: {
+                    useCacheOnUpdate: ((.buildOptions.useCacheOnUpdate // true) | tostring),
+                    skipBuild: ((.buildOptions.skipBuild // false) | tostring)
+                  }
+                }))
+              else
+                [{
+                  id: "api",
+                  build: (.api.build // "./api"),
+                  image: (.api.image // null),
+                  port: ((.api.port // 8080) | tostring),
+                  configFile: (.api.configFile // null),
+                  volumes: (.api.volumes // []),
+                  buildOptions: {
+                    useCacheOnUpdate: ((.api.buildOptions.useCacheOnUpdate // true) | tostring),
+                    skipBuild: ((.api.buildOptions.skipBuild // false) | tostring)
+                  }
+                }]
+              end
+            )
+          else
+            []
+          end
+        ),
+        dbs: (
+          if (.dbs // null) != null then
+            (.dbs | map({
+              id: (.id // "db"),
+              engine: (if (.engine // null) == null then "mysql" else .engine end),
+              name: (.name // .database // null),
+              user: (.user // null),
+              password: (.password // null),
+              rootPassword: (.rootPassword // null),
+              initSql: (.initSql // null),
+              version: (.version // null)
+            }))
+          else
+            [(
+              if (.db // null) == null then
+                { id:"db", engine:"mysql", name:null, user:null, password:null, rootPassword:null, initSql:null, version:null }
+              else
+                {
+                  id: "db",
+                  engine: (if (.db.engine // null) == null then "mysql" else .db.engine end),
+                  name: (.db.name // .db.database // null),
+                  user: (.db.user // null),
+                  password: (.db.password // null),
+                  rootPassword: (.db.rootPassword // null),
+                  initSql: (.db.initSql // null),
+                  version: (.db.version // null)
+                }
+              end
+            )]
+          end
+        ),
+        api: (.api // null),
+        db:  (.db  // null),
+        paths: {
+          apiPrefixes: (.paths.apiPrefixes // ["/api/"]),
+          stripApiPrefix: ((.paths.stripApiPrefix // false)|tostring),
+          apiRoutes: (
+            if (.paths.apiRoutes // null) != null then
+              (.paths.apiRoutes | map({
+                prefixes: (.prefixes // ["/api/"]),
+                targetApiId: (.targetApiId // "api"),
+                strip: ((.strip // (.paths.stripApiPrefix // false)) | tostring)
+              }))
+            else
+              [ {
+                prefixes: (.paths.apiPrefixes // ["/api/"]),
+                targetApiId: (.paths.apiTargetApiId // (if (.apis // null) != null and ((.apis|length)>0) then (.apis[0].id // "api") else "api" end)),
+                strip: ((.paths.stripApiPrefix // false) | tostring)
+              } ]
+            end
+          )
+        },
         useExternalDbOf: (.useExternalDbOf // "")
       }
   ' "$cfg"
@@ -507,32 +511,49 @@ compose_add_api() {
   dbs_len="$(jq -r '.dbs | length' "$norm" 2>/dev/null || echo 0)"
   if [ "${dbs_len:-0}" -gt 0 ]; then
     for di in $(seq 0 $((dbs_len-1))); do
-      local eng; eng="$(jq -r ".dbs[$di].engine // empty" "$norm")"
-      if [ -n "$eng" ] && [ "$eng" != "null" ] && [ "$eng" != "none" ]; then any_db="yes"; break; fi
+      local eng
+      eng="$(jq -r ".dbs[$di].engine // empty" "$norm")"
+      if [ -n "$eng" ] && [ "$eng" != "null" ] && [ "$eng" != "none" ]; then
+        any_db="yes"
+        break
+      fi
     done
   fi
 
   for i in $(seq 0 $((apis_len-1))); do
-    local api_id a_build a_image a_port a_conf api_volumes_json apiDomain
+    local api_id a_build a_image a_port a_conf api_volumes_json apiDomain api_skip
     api_id="$(jq -r ".apis[$i].id // \"api$((i+1))\"" "$norm")"
     a_build="$(jq -r ".apis[$i].build // \"./api\"" "$norm")"
     a_image="$(jq -r ".apis[$i].image // empty" "$norm")"
     a_port="$(jq -r ".apis[$i].port // \"8080\"" "$norm")"
     a_conf="$(jq -r ".apis[$i].configFile // empty" "$norm")"
     api_volumes_json="$(jq -c ".apis[$i].volumes // []" "$norm")"
+    api_skip="$(jq -r ".apis[$i].buildOptions.skipBuild // \"false\"" "$norm")"
 
-    # apiDomain stays site-level for now (you can add per-api later if you want)
+    # apiDomain stays site-level for now
     apiDomain="$(json_get '.apiDomain' "$norm")"
 
     local api_svc="${svc}-api-${api_id}"
+    local implicit_image="docker.io/library/${svc}-${api_svc}"
 
     echo "  ${api_svc}:" >> "$out"
 
-    if [ -n "$a_image" ] && [ "$a_image" != "null" ]; then
-      echo "    image: ${a_image}" >> "$out"
+    if [ "$api_skip" = "true" ]; then
+      # Strict skip: emit image only, never build
+      if [ -n "$a_image" ] && [ "$a_image" != "null" ]; then
+        echo "    image: ${a_image}" >> "$out"
+        echo "    pull_policy: never" >> "$out"
+      else
+        echo "    image: ${implicit_image}" >> "$out"
+        echo "    pull_policy: never" >> "$out"
+      fi
     else
-      echo "    build:" >> "$out"
-      echo "      context: ${a_build}" >> "$out"
+      if [ -n "$a_image" ] && [ "$a_image" != "null" ]; then
+        echo "    image: ${a_image}" >> "$out"
+      else
+        echo "    build:" >> "$out"
+        echo "      context: ${a_build}" >> "$out"
+      fi
     fi
 
     cat >> "$out" <<YAML
@@ -785,7 +806,7 @@ write_vhost_rules() {
 
         # Iterate prefixes inside route
         echo "$route" | jq -r '.prefixes[]' | while read -r prefix; do
-          case "$prefix" in */) : ;; *) prefix="${prefix}/";; esac
+#          case "$prefix" in */) : ;; *) prefix="${prefix}/";; esac
 
           if [ "$route_strip" = "true" ]; then
             cat >> "$tmp_file" <<EOP
@@ -1036,6 +1057,44 @@ write_site_compose() {
 
 # ---------- Runtime Controls ----------
 
+api_skip_build() {
+  local norm="$1" api_id="$2"
+  jq -r --arg id "$api_id" '
+    (.apis[] | select(.id==$id) | .buildOptions.skipBuild) // "false"
+  ' "$norm" 2>/dev/null | head -n1
+}
+
+api_use_cache_on_update() {
+  local norm="$1" api_id="$2"
+  jq -r --arg id "$api_id" '
+    (.apis[] | select(.id==$id) | .buildOptions.useCacheOnUpdate) // "true"
+  ' "$norm" 2>/dev/null | head -n1
+}
+
+api_service_name() {
+  local site_name="$1" api_id="$2"
+  local svc
+  svc="$(safe_id "$site_name")"
+  echo "${svc}-api-${api_id}"
+}
+
+list_buildable_api_services() {
+  local norm="$1"
+  local name apis_len
+  name="$(json_get '.name' "$norm")"
+  apis_len="$(jq -r '.apis | length' "$norm" 2>/dev/null || echo 0)"
+  [ "${apis_len:-0}" -gt 0 ] || return 0
+
+  for i in $(seq 0 $((apis_len-1))); do
+    local api_id skip
+    api_id="$(jq -r ".apis[$i].id // \"api$((i+1))\"" "$norm")"
+    skip="$(api_skip_build "$norm" "$api_id")"
+    if [ "$skip" != "true" ]; then
+      api_service_name "$name" "$api_id"
+    fi
+  done
+}
+
 site_up_nocache() {
   (cd "${BASE_DIR}/$1" && sudo docker compose build --no-cache --pull && sudo docker compose up -d)
 }
@@ -1047,14 +1106,95 @@ site_up_front_nocache() {
 }
 
 site_up_api_nocache() {
-  local name="$1" svc
-  svc="$(safe_id "$name")"
-  (cd "${BASE_DIR}/${name}" && sudo docker compose build --no-cache --pull "${svc}-api" && sudo docker compose up -d "${svc}-api")
+  local norm="$1"
+  local name site_dir
+  name="$(json_get '.name' "$norm")"
+  site_dir="${BASE_DIR}/${name}"
+
+  mapfile -t api_services < <(list_buildable_api_services "$norm")
+
+  (
+    cd "$site_dir"
+    if [ "${#api_services[@]}" -gt 0 ]; then
+      sudo docker compose build --no-cache --pull "${api_services[@]}"
+      sudo docker compose up -d "${api_services[@]}"
+    else
+      echo "[flux] no API services to build/update"
+    fi
+  )
 }
 
 site_up()       { (cd "${BASE_DIR}/$1" && sudo docker compose up -d --build); }
 site_up_force() { (cd "${BASE_DIR}/$1" && sudo docker compose build --no-cache --pull && sudo docker compose up -d --force-recreate); }
 site_down()     { (cd "${BASE_DIR}/$1" && sudo docker compose down || true); }
+
+site_add_with_api_policy() {
+  local norm="$1"
+  local name svc site_dir front_service
+  name="$(json_get '.name' "$norm")"
+  svc="$(safe_id "$name")"
+  site_dir="${BASE_DIR}/${name}"
+  front_service="${svc}-front"
+
+  mapfile -t api_services < <(list_buildable_api_services "$norm")
+
+  (
+    cd "$site_dir"
+
+    if [ "${#api_services[@]}" -gt 0 ]; then
+      echo "[flux] add: building non-skipped APIs with --no-cache"
+      sudo docker compose build --no-cache --pull "${api_services[@]}"
+    else
+      echo "[flux] add: no API services to build"
+    fi
+
+    # Build frontend separately so we do not accidentally build skipped APIs
+    echo "[flux] add: building frontend with --no-cache"
+    sudo docker compose build --no-cache --pull "${front_service}"
+
+    # Now bring everything up without --build
+    sudo docker compose up -d
+  )
+}
+
+site_update_with_api_policy() {
+  local norm="$1"
+  local name svc site_dir apis_len
+  name="$(json_get '.name' "$norm")"
+  svc="$(safe_id "$name")"
+  site_dir="${BASE_DIR}/${name}"
+
+  apis_len="$(jq -r '.apis | length' "$norm" 2>/dev/null || echo 0)"
+
+  (
+    cd "$site_dir"
+
+    if [ "${apis_len:-0}" -gt 0 ]; then
+      for i in $(seq 0 $((apis_len-1))); do
+        local api_id skip use_cache api_service
+        api_id="$(jq -r ".apis[$i].id // \"api$((i+1))\"" "$norm")"
+        skip="$(api_skip_build "$norm" "$api_id")"
+        use_cache="$(api_use_cache_on_update "$norm" "$api_id")"
+        api_service="${svc}-api-${api_id}"
+
+        if [ "$skip" = "true" ]; then
+          echo "[flux] api ${api_id}: skipBuild=true → keeping existing image/container"
+          continue
+        fi
+
+        if [ "$use_cache" = "true" ]; then
+          echo "[flux] api ${api_id}: building with cache"
+          sudo docker compose build "$api_service"
+        else
+          echo "[flux] api ${api_id}: building with --no-cache"
+          sudo docker compose build --no-cache --pull "$api_service"
+        fi
+      done
+    fi
+
+    sudo docker compose up -d
+  )
+}
 
 site_up_front() {
   local name="$1" svc
@@ -1063,9 +1203,8 @@ site_up_front() {
 }
 
 site_up_api() {
-  local name="$1" svc
-  svc="$(safe_id "$name")"
-  (cd "${BASE_DIR}/${name}" && sudo docker compose up -d --build "${svc}-api")
+  local norm="$1"
+  site_update_with_api_policy "$norm"
 }
 
 
@@ -1123,24 +1262,41 @@ cmd_add_update() {
   apply_front_replacements "$cfg" "${BASE_DIR}/${name}"
 
     # 1) Bring services up first (so upstreams exist on proxy_net)
-    case "$mode" in
-    add)
-                       if [ "$nocache" = "yes" ]; then site_up_nocache "$name"; else site_up "$name"; fi
-                       ;;
-                     update)
-                       if [ "$nocache" = "yes" ]; then site_up_nocache "$name"; else site_up_force "$name"; fi
-                       ;;
-                     update-front)
-                       if [ "$nocache" = "yes" ]; then site_up_front_nocache "$name"; else site_up_front "$name"; fi
-                       ;;
-                     update-api)
-                       if [ "$nocache" = "yes" ]; then site_up_api_nocache "$name"; else site_up_api "$name"; fi
-                       ;;
-      *)
-        echo "Unknown cmd_add_update mode: $mode" >&2
-        site_up "$name"
-        ;;
-    esac
+        case "$mode" in
+          add)
+            # First install: always ignore cache for APIs, but still respect skipBuild
+            site_add_with_api_policy "$norm_file"
+            ;;
+
+          update)
+            if [ "$nocache" = "yes" ]; then
+              site_up_nocache "$name"
+            else
+              site_update_with_api_policy "$norm_file"
+            fi
+            ;;
+
+          update-front)
+            if [ "$nocache" = "yes" ]; then
+              site_up_front_nocache "$name"
+            else
+              site_up_front "$name"
+            fi
+            ;;
+
+          update-api)
+            if [ "$nocache" = "yes" ]; then
+              site_up_api_nocache "$norm_file"
+            else
+              site_up_api "$norm_file"
+            fi
+            ;;
+
+          *)
+            echo "Unknown cmd_add_update mode: $mode" >&2
+            site_up "$name"
+            ;;
+        esac
 
 
   # 2) Wait for front and (if fullstack) api to be reachable from nginx-proxy
@@ -1148,17 +1304,24 @@ cmd_add_update() {
   local f_port="$(json_get '.frontend.port' "$norm_file")"; [ -z "$f_port" ] && f_port="80"
   wait_service_ready "${svc}-front" "$f_port" 30 || true
 
-   if [ "$(json_get '.type' "$norm_file")" = "fullstack" ]; then
-     local apis_len; apis_len="$(jq -r '.apis | length' "$norm_file" 2>/dev/null || echo 0)"
-     if [ "${apis_len:-0}" -gt 0 ]; then
-       for i in $(seq 0 $((apis_len-1))); do
-         local api_id a_port
-         api_id="$(jq -r ".apis[$i].id // \"api$((i+1))\"" "$norm_file")"
-         a_port="$(jq -r ".apis[$i].port // \"8080\"" "$norm_file")"
-         wait_service_ready "${svc}-api-${api_id}" "$a_port" 30 || true
-       done
-     fi
-   fi
+      if [ "$(json_get '.type' "$norm_file")" = "fullstack" ]; then
+        local apis_len; apis_len="$(jq -r '.apis | length' "$norm_file" 2>/dev/null || echo 0)"
+        if [ "${apis_len:-0}" -gt 0 ]; then
+          for i in $(seq 0 $((apis_len-1))); do
+            local api_id a_port skip
+            api_id="$(jq -r ".apis[$i].id // \"api$((i+1))\"" "$norm_file")"
+            a_port="$(jq -r ".apis[$i].port // \"8080\"" "$norm_file")"
+            skip="$(api_skip_build "$norm_file" "$api_id")"
+
+            if [ "$skip" = "true" ]; then
+              echo "[flux] api ${api_id}: skipBuild=true → skipping readiness check"
+              continue
+            fi
+
+            wait_service_ready "${svc}-api-${api_id}" "$a_port" 30 || true
+          done
+        fi
+      fi
 
 
   # 3) Now write vhost rules atomically and reload
